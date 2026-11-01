@@ -11,6 +11,19 @@ APP_ID = os.environ.get("FEISHU_APP_ID") or CONFIG["feishu_app_id"]
 APP_SECRET = os.environ.get("FEISHU_APP_SECRET") or CONFIG["feishu_app_secret"]
 ZHIPU_KEY = os.environ.get("ZHIPU_KEY") or CONFIG["zhipu_key"]
 VERIFY_TOKEN = os.environ.get("FEISHU_VERIFY_TOKEN") or CONFIG.get("feishu_verify_token", "")
+ENCRYPT_KEY = os.environ.get("FEISHU_ENCRYPT_KEY") or CONFIG.get("feishu_encrypt_key", "")
+
+
+def decrypt_payload(encrypt_str):
+    import hashlib, base64
+    from Crypto.Cipher import AES
+    key_hash = hashlib.sha256(ENCRYPT_KEY.encode("utf-8")).digest()
+    raw = base64.b64decode(encrypt_str)
+    iv, encrypted = raw[:16], raw[16:]
+    cipher = AES.new(key_hash, AES.MODE_CBC, iv)
+    plain = cipher.decrypt(encrypted)
+    pad = plain[-1]
+    return json.loads(plain[:-pad].decode("utf-8"))
 
 BASE_LIVE = "QGxybhAfFanBrusW5q9cOd2XnUc"
 BASE_ANCHOR = "MGY2bjjQpa579LsWnvYcOfPZnqe"
@@ -75,6 +88,11 @@ def webhook():
         data = json.loads(raw) if raw else {}
     except Exception:
         data = {}
+    if "encrypt" in data and ENCRYPT_KEY:
+        try:
+            data = decrypt_payload(data["encrypt"])
+        except Exception:
+            pass
     if "challenge" in data:
         return jsonify({"challenge": data["challenge"]})
     header = data.get("header", {})
