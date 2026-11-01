@@ -3,7 +3,10 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-CONFIG = json.load(open(os.path.join(os.path.dirname(__file__), "config.json"), encoding="utf-8"))
+try:
+    CONFIG = json.load(open(os.path.join(os.path.dirname(__file__), "config.json"), encoding="utf-8"))
+except (FileNotFoundError, json.JSONDecodeError):
+    CONFIG = {}
 APP_ID = os.environ.get("FEISHU_APP_ID") or CONFIG["feishu_app_id"]
 APP_SECRET = os.environ.get("FEISHU_APP_SECRET") or CONFIG["feishu_app_secret"]
 ZHIPU_KEY = os.environ.get("ZHIPU_KEY") or CONFIG["zhipu_key"]
