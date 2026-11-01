@@ -59,7 +59,10 @@ def ai_recognize(image_bytes, prompt):
             {"type": "text", "text": prompt},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}]},
         timeout=60)
-    return r.json()["choices"][0]["message"]["content"]
+    data = r.json()
+    if "choices" not in data:
+        raise Exception(f"智谱返回: {json.dumps(data, ensure_ascii=False)[:300]}")
+    return data["choices"][0]["message"]["content"]
 
 
 def write_record(base, table, fields):
