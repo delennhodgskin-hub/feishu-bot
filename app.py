@@ -94,7 +94,10 @@ def write_record(base, table, fields):
         f"https://open.feishu.cn/open-apis/bitable/v1/apps/{base}/tables/{table}/records",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         json={"fields": fields}, timeout=15)
-    return r.json()
+    data = r.json()
+    if data.get("code") != 0:
+        raise Exception(f"飞书写入失败 code={data.get('code')}: {data.get('msg','')}")
+    return data
 
 
 def send_group_msg(text):
@@ -159,9 +162,17 @@ def webhook():
     base = BASE_ANCHOR if rtype == "anchor" else BASE_LIVE
     table = TABLE_ANCHOR if rtype == "anchor" else TABLE_LIVE
     fields = {}
+    from datetime import datetime, timezone, timedelta
+    CST = timezone(timedelta(hours=8))  # 表格时区 Asia/Shanghai
     for k, v in result.items():
-        if k in ("数据日期", "账号", "主播姓名", "所属账号"):
-            fields[k] = v
+        if k == "数据日期":
+            # 飞书 datetime 字段要求毫秒时间戳；智谱返回 "YYYY-MM-DD" 字符串
+            try:
+                fields[k] = int(datetime.strptime(str(v)[:10], "%Y-%m-%d").replace(tzinfo=CST).timestamp() * 1000)
+            except Exception:
+                fields[k] = v
+        elif k in ("账号", "主播姓名", "所属账号", "人均观看时长"):
+            fields[k] = str(v)
         else:
             try:
                 fields[k] = float(v) if "." in str(v) else int(v)
