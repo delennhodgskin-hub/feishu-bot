@@ -42,11 +42,18 @@ def get_tenant_token():
     return r.json()["tenant_access_token"]
 
 
-def download_image(image_key):
+def download_image(message_id, file_key):
+    """下载群消息里的图片资源。
+    用消息资源接口 GET /im/v1/messages/{message_id}/resources/{file_key}?type=image，
+    而非 GET /im/v1/images/{image_key}——后者要求应用是图片上传者(飞书报 234008
+    'The app is not the resource sender')，群里 user 发的截图 bot 无权用该接口下载。"""
     token = get_tenant_token()
     r = requests.get(
-        f"https://open.feishu.cn/open-apis/im/v1/images/{image_key}",
-        headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{file_key}",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"type": "image"}, timeout=30)
+    if r.status_code != 200:
+        raise Exception(f"下载图片HTTP {r.status_code}: {r.text[:200]}")
     return r.content
 
 
@@ -135,7 +142,7 @@ def webhook():
     is_anchor = "主播" in full_text
     prompt = PROMPT_ANCHOR if is_anchor else PROMPT_LIVE
     try:
-        img = download_image(image_keys[0])
+        img = download_image(msg.get("message_id", ""), image_keys[0])
         ai_result = ai_recognize(img, prompt)
     except Exception as e:
         send_group_msg(f"AI识别失败: {e}")
