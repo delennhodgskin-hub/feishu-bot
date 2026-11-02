@@ -51,13 +51,15 @@ def download_image(image_key):
 
 
 def ai_recognize(image_bytes, prompt):
+    import imghdr
     b64 = base64.b64encode(image_bytes).decode()
+    fmt = imghdr.what(None, image_bytes) or "png"
     r = requests.post(
         "https://open.bigmodel.cn/api/paas/v4/chat/completions",
         headers={"Authorization": f"Bearer {ZHIPU_KEY}"},
         json={"model": "glm-4v-flash", "messages": [{"role": "user", "content": [
             {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}]},
+            {"type": "image_url", "image_url": {"url": f"data:image/{fmt};base64,{b64}"}}]}]},
         timeout=60)
     data = r.json()
     if "choices" not in data:
