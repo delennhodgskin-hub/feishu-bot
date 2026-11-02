@@ -161,33 +161,60 @@ def webhook():
     rtype = result.pop("类型", "anchor" if is_anchor else "live")
     base = BASE_ANCHOR if rtype == "anchor" else BASE_LIVE
     table = TABLE_ANCHOR if rtype == "anchor" else TABLE_LIVE
-    fields = {}
     from datetime import datetime, timezone, timedelta
+    import re
     CST = timezone(timedelta(hours=8))  # 表格时区 Asia/Shanghai
-    for k, v in result.items():
-        if k == "数据日期":
-            # 飞书 datetime 字段要求毫秒时间戳；智谱返回 "YYYY-MM-DD" 字符串
-            try:
-                fields[k] = int(datetime.strptime(str(v)[:10], "%Y-%m-%d").replace(tzinfo=CST).timestamp() * 1000)
-            except Exception:
-                fields[k] = v
-        elif k in ("账号", "主播姓名", "所属账号", "人均观看时长"):
-            fields[k] = str(v)
-        else:
-            try:
-                fields[k] = float(v) if "." in str(v) else int(v)
-            except (ValueError, TypeError):
-                fields[k] = v
-    fields["数据状态"] = "草稿"
-    fields["AI识别结果"] = ai_result
-    try:
-        write_record(base, table, fields)
-        label = result.get("账号") or result.get("主播姓名") or ""
-        date = result.get("数据日期", "")
-        send_group_msg(f"已识别并登记草稿：{label} {date}，请复查后改数据状态为已复查。")
-    except Exception as e:
-        send_group_msg(f"写入表格失败: {e}")
-        return jsonify({"ok": False, "error": str(e)})
+
+    def build_fields(rec):
+        """从单条记录构造飞书 fields：数据日期转毫秒时间戳、文本转str、数字清洗（去逗号/¥/元/%/单位）。
+        空值或清洗不出数字的字段跳过（留空待人工复查补），避免 NumberFieldConvFail。"""
+        f = {}
+        for k, v in rec.items():
+            if k == "数据日期":
+                try:
+                    f[k] = int(datetime.strptime(str(v)[:10], "%Y-%m-%d").replace(tzinfo=CST).timestamp() * 1000)
+                except Exception:
+                    pass  # 空或格式不对则跳过（datetime 字段留空）
+            elif k in ("账号", "主播姓名", "所属账号", "人均观看时长"):
+                if str(v).strip():
+                    f[k] = str(v)
+            else:
+                s = str(v).strip().replace(",", "").replace("，", "")
+                s = re.sub(r"[¥元%人件秒个次]", "", s)
+                m = re.search(r"-?\d+\.?\d*", s)
+                if m:
+                    num = m.group()
+                    f[k] = float(num) if "." in num else int(num)
+        f["数据状态"] = "草稿"
+        f["AI识别结果"] = ai_result
+        return f
+
+    # 检测多主播/多账号：真实主播对比表截图智谱返回数组（如4主播一屏），需拆成多条记录
+    list_keys = [k for k, v in result.items() if isinstance(v, list)]
+    if list_keys:
+        n = max(len(result[k]) for k in list_keys)
+        records = [{} for _ in range(n)]
+        for k, v in result.items():
+            for i in range(n):
+                records[i][k] = v[i] if isinstance(v, list) and i < len(v) else v
+    else:
+        records = [result]
+
+    ok_count, labels = 0, []
+    for rec in records:
+        fields = build_fields(rec)
+        if len(fields) <= 2:  # 只有数据状态+AI识别结果，无有效业务数据，跳过
+            continue
+        try:
+            write_record(base, table, fields)
+            ok_count += 1
+            labels.append(rec.get("账号") or rec.get("主播姓名") or "未命名")
+        except Exception as e:
+            send_group_msg(f"写入表格失败({rec.get('主播姓名') or rec.get('账号') or '?'}): {e}")
+    if ok_count:
+        send_group_msg(f"已识别并登记 {ok_count} 条草稿：{', '.join(labels)}，请复查后改数据状态为已复查。")
+    else:
+        send_group_msg("识别完成但无有效数据写入，请检查截图清晰度或人工录入。")
     return jsonify({"ok": True})
 
 
