@@ -50,10 +50,24 @@ def download_image(image_key):
     return r.content
 
 
+def detect_image_format(image_bytes):
+    """通过文件头魔数检测图片格式，零依赖。
+    替代已废弃的 imghdr：imghdr 在 Python 3.11 弃用、3.13 彻底移除，
+    render.com 跑 Python 3.13，import imghdr 会直接 ModuleNotFoundError。"""
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if image_bytes.startswith(b"\xff\xd8"):
+        return "jpeg"
+    if image_bytes[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+        return "webp"
+    return "png"  # 飞书截图默认 PNG
+
+
 def ai_recognize(image_bytes, prompt):
-    import imghdr
     b64 = base64.b64encode(image_bytes).decode()
-    fmt = imghdr.what(None, image_bytes) or "png"
+    fmt = detect_image_format(image_bytes)
     r = requests.post(
         "https://open.bigmodel.cn/api/paas/v4/chat/completions",
         headers={"Authorization": f"Bearer {ZHIPU_KEY}"},
