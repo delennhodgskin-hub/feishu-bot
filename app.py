@@ -111,17 +111,29 @@ def send_group_msg(text):
 
 
 ACCOUNTS = ["佳能Canon数码旗舰店", "Canon佳能摄影摄像旗舰店", "汉印拍立得旗舰店"]
+# 账号简称关键词 → 完整账号名（蔡广文可能写"佳能数码旗舰店"而非完整名）
+ACCOUNT_KEYWORDS = [
+    ("佳能Canon数码", "佳能Canon数码旗舰店"),
+    ("佳能数码", "佳能Canon数码旗舰店"),       # 简称
+    ("Canon佳能摄影", "Canon佳能摄影摄像旗舰店"),
+    ("佳能摄影", "Canon佳能摄影摄像旗舰店"),    # 简称
+    ("摄影摄像", "Canon佳能摄影摄像旗舰店"),    # 简称
+    ("汉印拍立得", "汉印拍立得旗舰店"),
+    ("汉印", "汉印拍立得旗舰店"),              # 简称
+    ("拍立得", "汉印拍立得旗舰店"),            # 简称
+]
 
 
 def parse_text_meta(text):
     """从消息文字提取日期和账号（问题4：格式'时间+账号+直播数据'）。
     支持 '2026.11.1主播数据'、'2026-11-01 佳能Canon数码旗舰店 直播数据'、'11.1' 等。
+    账号支持简称（如'佳能数码'→佳能Canon数码旗舰店）。
     返回 (date_str 'YYYY-MM-DD' or None, account or None)。"""
     import re
     account = None
-    for a in ACCOUNTS:
-        if a in text:
-            account = a
+    for keyword, full_name in ACCOUNT_KEYWORDS:
+        if keyword in text:
+            account = full_name
             break
     # 完整日期 2026.11.1 / 2026-11-01
     m = re.search(r"(20\d{2})[.\-/](\d{1,2})[.\-/](\d{1,2})", text)
@@ -217,8 +229,12 @@ def webhook():
     if msg.get("message_type") != "post":
         return jsonify({"ok": True})
     content = json.loads(msg.get("content", "{}"))
+    # 兼容飞书 post 消息两种 content 结构：
+    #   {"zh_cn":{"content":[...]}}  （飞书事件推送的标准格式，有 locale 嵌套）
+    #   {"content":[...]}            （部分客户端/伪造测试的扁平格式）
+    post_obj = content.get("zh_cn") or content.get("en_us") or content
     image_keys, text_parts = [], []
-    for row in content.get("content", []):
+    for row in post_obj.get("content", []):
         for node in row:
             if node.get("tag") == "img":
                 image_keys.append(node.get("image_key"))
