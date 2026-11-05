@@ -154,7 +154,10 @@ def parse_text_meta(text):
 
 
 def list_records(base, table, page_size=100):
-    """拉取表格已有记录（用于去重判断）"""
+    """拉取表格已有记录（用于去重判断）。
+    注意：飞书表格为空时 data.items 值是 null（key 存在但值为 null），
+    此时 .get("items", []) 返回的是 None 而非 []（默认值只在 key 不存在时生效），
+    必须显式处理 None，否则 is_duplicate 里 for rec in existing 会报 NoneType。"""
     try:
         token = get_tenant_token()
         r = requests.get(
@@ -164,7 +167,8 @@ def list_records(base, table, page_size=100):
         data = r.json()
         if data.get("code") != 0:
             return []
-        return data.get("data", {}).get("items", [])
+        items = data.get("data", {}).get("items")
+        return items if isinstance(items, list) else []
     except Exception:
         return []
 
@@ -184,6 +188,8 @@ def is_duplicate(fields, existing, rtype):
     """去重判断。
     主播：数据日期+主播姓名+所属账号 相同视为重复（每天每人只一条）
     直播：数据日期+账号+直播间成交金额 相同视为重复（同天同账号不同成交金额=不同场，允许）"""
+    if not existing:  # 防御：existing 为 None/[] 时直接返回不重复
+        return False
     my_date = fields.get("数据日期")
     if rtype == "anchor":
         my_anchor = fields.get("主播姓名")
@@ -396,7 +402,7 @@ def index():
 def version():
     """版本和环境变量状态确认（排查部署问题用）"""
     return jsonify({
-        "version": "7.2",
+        "version": "7.3",
         "encrypt_key_set": bool(ENCRYPT_KEY),
         "app_id_set": bool(APP_ID),
         "app_secret_set": bool(APP_SECRET),
