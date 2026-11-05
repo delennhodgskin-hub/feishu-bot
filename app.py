@@ -101,13 +101,16 @@ def write_record(base, table, fields):
 
 
 def send_group_msg(text):
-    token = get_tenant_token()
-    requests.post(
-        "https://open.feishu.cn/open-apis/im/v1/messages",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        params={"receive_id_type": "chat_id"},
-        json={"receive_id": GROUP_CHAT, "msg_type": "text",
-              "content": json.dumps({"text": text})}, timeout=15)
+    try:
+        token = get_tenant_token()
+        requests.post(
+            "https://open.feishu.cn/open-apis/im/v1/messages",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            params={"receive_id_type": "chat_id"},
+            json={"receive_id": GROUP_CHAT, "msg_type": "text",
+                  "content": json.dumps({"text": text})}, timeout=15)
+    except Exception:
+        pass  # 发群消息失败不阻断主流程，避免 500
 
 
 ACCOUNTS = ["佳能Canon数码旗舰店", "Canon佳能摄影摄像旗舰店", "汉印拍立得旗舰店"]
@@ -209,6 +212,20 @@ def is_duplicate(fields, existing, rtype):
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    """外层兜底：捕获所有异常，返回具体错误信息（不再 500）"""
+    try:
+        return _handle_webhook()
+    except Exception as e:
+        import traceback
+        err = f"{e}\n{traceback.format_exc()[-300:]}"
+        try:
+            send_group_msg(f"处理异常: {str(e)[:200]}")
+        except Exception:
+            pass
+        return jsonify({"ok": False, "error": err})
+
+
+def _handle_webhook():
     raw = request.get_data(as_text=True)
     try:
         data = json.loads(raw) if raw else {}
@@ -356,6 +373,19 @@ def webhook():
 @app.route("/", methods=["GET"])
 def index():
     return "feishu-bot running"
+
+
+@app.route("/version", methods=["GET"])
+def version():
+    """版本和环境变量状态确认（排查部署问题用）"""
+    return jsonify({
+        "version": "7.1",
+        "encrypt_key_set": bool(ENCRYPT_KEY),
+        "app_id_set": bool(APP_ID),
+        "app_secret_set": bool(APP_SECRET),
+        "zhipu_key_set": bool(ZHIPU_KEY),
+        "group_chat_set": bool(GROUP_CHAT),
+    })
 
 
 if __name__ == "__main__":
