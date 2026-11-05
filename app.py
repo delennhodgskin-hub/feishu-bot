@@ -32,7 +32,31 @@ TABLE_ANCHOR = "tbljoPMRJvyzKupS"
 GROUP_CHAT = "oc_ecc73eac1ebd2fe694ef5b3d7687587f"
 
 PROMPT_LIVE = "识别这张抖音电商罗盘直播数据截图。返回JSON，字段：类型(填live)、数据日期(YYYY-MM-DD)、账号(佳能Canon数码旗舰店/Canon佳能摄影摄像旗舰店/汉印拍立得旗舰店)、直播间成交金额、用户支付金额、千次观看成交金额、成交人数、成交件数、转化率(小数)、商品点击-成交率(小数)、平均在线人数、曝光-进入率(小数)、人均观看时长(秒整数)、退款金额、退款金额占比(小数)、新增粉丝数。数值只返数字。只返JSON不要其他文字。"
-PROMPT_ANCHOR = "识别这张抖音电商罗盘主播分析数据截图。返回JSON，字段：类型(填anchor)、数据日期(YYYY-MM-DD)、主播姓名、所属账号(佳能Canon数码旗舰店/Canon佳能摄影摄像旗舰店/汉印拍立得旗舰店)、引流-曝光进入率(小数)、留存率(小数)、互动率(小数)、新增粉丝(整数)、观看-关注率(小数)、新增团人数(整数)、UV价值、单小时支付金额、最高在线(整数)、平均在线(整数)、平均客单价、成交金额。数值只返数字。只返JSON不要其他文字。"
+PROMPT_ANCHOR = """识别这张抖音电商罗盘主播分析数据截图。这是主播对比表，可能显示基础数据或能力分析数据。
+返回严格JSON格式（不要markdown代码块），字段：
+- 类型：固定填"anchor"
+- 数据日期：YYYY-MM-DD格式，如果图里没有就填空字符串""
+- 主播姓名：数组，每个主播一个元素（如["张三","李四"]）
+- 所属账号：数组，每个主播对应的账号
+- 引流-曝光观看率：数组，小数（如0.109表示10.9%）
+- 留存率：数组，小数
+- 观看互动率：数组，小数
+- 新增粉丝：数组，整数
+- 观看-关注率：数组，小数
+- 新增团人数：数组，整数
+- UV价值：数组，数字
+- 单小时支付金额：数组，数字（去逗号）
+- 最高在线：数组，整数
+- 平均在线：数组，整数
+- 平均客单价：数组，数字（去逗号）
+- 成交金额：数组，数字（去逗号）
+
+重要规则：
+1. 所有字段都返回数组（即使只有1个主播）
+2. 如果图里某个指标没有显示，对应位置填空字符串""
+3. 数值不要带¥、逗号、%等符号，只返纯数字
+4. 主播姓名要准确识别，不要编造
+5. 只返JSON，不要任何其他文字、不要markdown代码块"""
 
 
 def get_tenant_token():
@@ -367,58 +391,137 @@ def _handle_webhook(raw):
     # 预拉取表格已有记录用于去重（问题2、3：每天每人/每账号只一组，重复发消息不重复登记）
     existing = list_records(base, table)
 
-    total_ok, all_labels, skipped_dups, errors = 0, [], 0, []
-    for idx, img_key in enumerate(image_keys):
-        try:
-            img = download_image(message_id, img_key)
-            ai_result = ai_recognize(img, prompt)
-        except Exception as e:
-            errors.append(f"第{idx+1}张图识别失败: {e}")
-            continue
-        try:
-            clean = ai_result.strip()
-            if clean.startswith("```"):
-                clean = clean.split("\n", 1)[1].rsplit("```", 1)[0]
-            result = json.loads(clean)
-        except Exception:
-            errors.append(f"第{idx+1}张图JSON解析失败: {ai_result[:120]}")
-            continue
-
-        # 用消息文字的日期/账号覆盖AI识别结果（问题4）
-        if msg_date:
-            result["数据日期"] = msg_date
-        if msg_account:
-            if is_anchor:
-                result["所属账号"] = msg_account
-            else:
-                result["账号"] = msg_account
-
-        rtype = result.pop("类型", rtype_hint)
-
-        # 多主播拆分：主播对比表一屏多主播，智谱返回数组，拆成多条
-        list_keys = [k for k, v in result.items() if isinstance(v, list)]
-        if list_keys:
-            n = max(len(result[k]) for k in list_keys)
-            records = [{} for _ in range(n)]
-            for k, v in result.items():
-                for i in range(n):
-                    records[i][k] = v[i] if isinstance(v, list) and i < len(v) else v
-        else:
-            records = [result]
-
-        for rec in records:
-            fields = build_fields(rec, ai_result)
-            if len(fields) <= 2:  # 只有数据状态+AI识别结果，无有效业务数据，跳过
+    # 主播消息特殊处理：多张图可能是同一批主播的不同维度数据（基础数据+能力分析）
+    # 需要按主播姓名合并到同一条记录，而非分开识别
+    if is_anchor:
+        # 收集所有图片的识别结果
+        all_anchor_results = []
+        for idx, img_key in enumerate(image_keys):
+            try:
+                img = download_image(message_id, img_key)
+                ai_result = ai_recognize(img, prompt)
+            except Exception as e:
+                errors.append(f"第{idx+1}张图识别失败: {e}")
                 continue
-            if is_duplicate(fields, existing, rtype):
+            try:
+                clean = ai_result.strip()
+                if clean.startswith("```"):
+                    clean = clean.split("\n", 1)[1].rsplit("```", 1)[0]
+                result = json.loads(clean)
+            except Exception:
+                errors.append(f"第{idx+1}张图JSON解析失败: {ai_result[:120]}")
+                continue
+            # 用消息文字的日期/账号覆盖
+            if msg_date:
+                result["数据日期"] = msg_date
+            if msg_account:
+                result["所属账号"] = msg_account
+            result.pop("类型", None)
+            all_anchor_results.append((idx, ai_result, result))
+
+        # 按主播姓名合并多张图的数据
+        merged_anchors = {}  # 主播姓名 -> 合并后的记录
+        for idx, ai_raw, result in all_anchor_results:
+            # 拆分多主播
+            list_keys = [k for k, v in result.items() if isinstance(v, list)]
+            if list_keys:
+                n = max(len(result[k]) for k in list_keys)
+                for i in range(n):
+                    rec = {}
+                    for k, v in result.items():
+                        rec[k] = v[i] if isinstance(v, list) and i < len(v) else v
+                    anchor_name = str(rec.get("主播姓名", "")).strip()
+                    if not anchor_name:
+                        continue
+                    if anchor_name not in merged_anchors:
+                        merged_anchors[anchor_name] = {"_ai_raw": ai_raw}
+                    # 合并字段（后识别的补充先识别的空值）
+                    for k, v in rec.items():
+                        if k == "主播姓名":
+                            continue
+                        existing_val = merged_anchors[anchor_name].get(k)
+                        # 只在原值为空或不存在时填充
+                        if existing_val is None or str(existing_val).strip() == "":
+                            merged_anchors[anchor_name][k] = v
+            else:
+                anchor_name = str(result.get("主播姓名", "")).strip()
+                if not anchor_name:
+                    continue
+                if anchor_name not in merged_anchors:
+                    merged_anchors[anchor_name] = {"_ai_raw": ai_raw}
+                for k, v in result.items():
+                    if k == "主播姓名":
+                        continue
+                    existing_val = merged_anchors[anchor_name].get(k)
+                    if existing_val is None or str(existing_val).strip() == "":
+                        merged_anchors[anchor_name][k] = v
+
+        # 写入合并后的主播记录
+        for anchor_name, rec in merged_anchors.items():
+            ai_raw = rec.pop("_ai_raw", "")
+            rec["主播姓名"] = anchor_name
+            fields = build_fields(rec, ai_raw)
+            if len(fields) <= 2:
+                continue
+            if is_duplicate(fields, existing, "anchor"):
                 skipped_dups += 1
                 continue
             try:
                 write_record(base, table, fields)
                 total_ok += 1
-                all_labels.append(rec.get("账号") or rec.get("主播姓名") or "未命名")
+                all_labels.append(anchor_name)
             except Exception as e:
-                errors.append(f"写入失败({rec.get('主播姓名') or rec.get('账号') or '?'}): {e}")
+                errors.append(f"写入失败({anchor_name}): {e}")
+    else:
+        # 直播消息：每张图是一条独立记录（两张图=两场直播）
+        for idx, img_key in enumerate(image_keys):
+            try:
+                img = download_image(message_id, img_key)
+                ai_result = ai_recognize(img, prompt)
+            except Exception as e:
+                errors.append(f"第{idx+1}张图识别失败: {e}")
+                continue
+            try:
+                clean = ai_result.strip()
+                if clean.startswith("```"):
+                    clean = clean.split("\n", 1)[1].rsplit("```", 1)[0]
+                result = json.loads(clean)
+            except Exception:
+                errors.append(f"第{idx+1}张图JSON解析失败: {ai_result[:120]}")
+                continue
+
+            # 用消息文字的日期/账号覆盖AI识别结果（问题4）
+            if msg_date:
+                result["数据日期"] = msg_date
+            if msg_account:
+                result["账号"] = msg_account
+
+            rtype = result.pop("类型", rtype_hint)
+
+            # 多主播拆分：主播对比表一屏多主播，智谱返回数组，拆成多条
+            list_keys = [k for k, v in result.items() if isinstance(v, list)]
+            if list_keys:
+                n = max(len(result[k]) for k in list_keys)
+                records = [{} for _ in range(n)]
+                for k, v in result.items():
+                    for i in range(n):
+                        records[i][k] = v[i] if isinstance(v, list) and i < len(v) else v
+            else:
+                records = [result]
+
+            for rec in records:
+                fields = build_fields(rec, ai_result)
+                if len(fields) <= 2:  # 只有数据状态+AI识别结果，无有效业务数据，跳过
+                    continue
+                if is_duplicate(fields, existing, rtype):
+                    skipped_dups += 1
+                    continue
+                try:
+                    write_record(base, table, fields)
+                    total_ok += 1
+                    all_labels.append(rec.get("账号") or rec.get("主播姓名") or "未命名")
+                except Exception as e:
+                    errors.append(f"写入失败({rec.get('主播姓名') or rec.get('账号') or '?'}): {e}")
 
     # 汇总群回复
     parts = []
@@ -445,7 +548,7 @@ def index():
 def version():
     """版本和环境变量状态确认（排查部署问题用）"""
     return jsonify({
-        "version": "7.5",
+        "version": "7.6",
         "encrypt_key_set": bool(ENCRYPT_KEY),
         "app_id_set": bool(APP_ID),
         "app_secret_set": bool(APP_SECRET),
