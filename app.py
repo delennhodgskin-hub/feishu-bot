@@ -217,12 +217,13 @@ def webhook():
         return _handle_webhook()
     except Exception as e:
         import traceback
-        err = f"{e}\n{traceback.format_exc()[-300:]}"
+        tb = traceback.format_exc()
+        # 把完整 traceback 发群里，精简到最后 800 字符（定位精确报错行）
         try:
-            send_group_msg(f"处理异常: {str(e)[:200]}")
+            send_group_msg(f"处理异常: {str(e)[:200]}\n\n--- traceback ---\n{tb[-800:]}")
         except Exception:
             pass
-        return jsonify({"ok": False, "error": err})
+        return jsonify({"ok": False, "error": str(e), "traceback": tb[-800:]})
 
 
 def _handle_webhook():
@@ -245,14 +246,30 @@ def _handle_webhook():
     msg = event.get("message", {})
     if msg.get("message_type") != "post":
         return jsonify({"ok": True})
-    content = json.loads(msg.get("content", "{}"))
-    # 兼容飞书 post 消息两种 content 结构：
+    content_raw = msg.get("content", "{}")
+    try:
+        content = json.loads(content_raw) if content_raw else {}
+    except Exception:
+        content = {}
+    if not isinstance(content, dict):
+        content = {}
+    # 兼容飞书 post 消息多种 content 结构：
     #   {"zh_cn":{"content":[...]}}  （飞书事件推送的标准格式，有 locale 嵌套）
+    #   {"title":"","content":[...]} （飞书消息 API 返回的扁平格式，无 locale）
     #   {"content":[...]}            （部分客户端/伪造测试的扁平格式）
     post_obj = content.get("zh_cn") or content.get("en_us") or content
+    if not isinstance(post_obj, dict):
+        post_obj = {}
+    content_rows = post_obj.get("content") or []
+    if not isinstance(content_rows, list):
+        content_rows = []
     image_keys, text_parts = [], []
-    for row in post_obj.get("content", []):
+    for row in content_rows:
+        if not isinstance(row, list):
+            continue
         for node in row:
+            if not isinstance(node, dict):
+                continue
             if node.get("tag") == "img":
                 image_keys.append(node.get("image_key"))
             elif node.get("tag") == "text":
@@ -379,7 +396,7 @@ def index():
 def version():
     """版本和环境变量状态确认（排查部署问题用）"""
     return jsonify({
-        "version": "7.1",
+        "version": "7.2",
         "encrypt_key_set": bool(ENCRYPT_KEY),
         "app_id_set": bool(APP_ID),
         "app_secret_set": bool(APP_SECRET),
