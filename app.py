@@ -218,8 +218,8 @@ def is_duplicate(fields, existing, rtype):
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """收到飞书回调后立即返回200（防止飞书因超时重试导致重复登记），
-    实际处理逻辑在后台线程执行。challenge 需同步返回（飞书验证URL用）。"""
+    """收到飞书回调后立即返回200（防止飞书因超时重试），
+    实际处理逻辑在后台线程执行。用 event_id 去重防止重复处理。"""
     import threading
     raw = request.get_data(as_text=True)
     # challenge 需同步返回（飞书验证URL时发challenge，不触发消息事件）
@@ -234,9 +234,23 @@ def webhook():
             pass
     if "challenge" in data_check:
         return jsonify({"challenge": data_check["challenge"]})
+    # event_id 去重：飞书重试推送时 event_id 相同，跳过避免重复处理
+    event_id = data_check.get("header", {}).get("event_id", "")
+    if event_id and event_id in _PROCESSED_EVENTS:
+        return jsonify({"ok": True, "msg": "duplicate event"})
+    if event_id:
+        _PROCESSED_EVENTS.add(event_id)
+        # 只保留最近100个，避免内存无限增长
+        if len(_PROCESSED_EVENTS) > 100:
+            _PROCESSED_EVENTS.clear()
+            _PROCESSED_EVENTS.add(event_id)
     # 后台线程处理消息，立即返回200
     threading.Thread(target=_process_in_background, args=(raw,), daemon=True).start()
     return jsonify({"ok": True})
+
+
+_PROCESSED_EVENTS = set()  # 已处理的 event_id，防止飞书重试导致重复
+_PROCESSED_MSGS = set()    # 已处理的 message_id，双重去重保险
 
 
 def _process_in_background(raw):
@@ -272,6 +286,15 @@ def _handle_webhook(raw):
     msg = event.get("message", {})
     if msg.get("message_type") != "post":
         return
+    # message_id 去重（双重保险）：同一条消息飞书重试时 message_id 相同，跳过
+    message_id_dedup = msg.get("message_id", "")
+    if message_id_dedup and message_id_dedup in _PROCESSED_MSGS:
+        return  # 已处理过这条消息，跳过
+    if message_id_dedup:
+        _PROCESSED_MSGS.add(message_id_dedup)
+        if len(_PROCESSED_MSGS) > 50:
+            _PROCESSED_MSGS.clear()
+            _PROCESSED_MSGS.add(message_id_dedup)
     content_raw = msg.get("content", "{}")
     try:
         content = json.loads(content_raw) if content_raw else {}
@@ -422,7 +445,7 @@ def index():
 def version():
     """版本和环境变量状态确认（排查部署问题用）"""
     return jsonify({
-        "version": "7.4",
+        "version": "7.5",
         "encrypt_key_set": bool(ENCRYPT_KEY),
         "app_id_set": bool(APP_ID),
         "app_secret_set": bool(APP_SECRET),
