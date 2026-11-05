@@ -218,22 +218,42 @@ def is_duplicate(fields, existing, rtype):
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """外层兜底：捕获所有异常，返回具体错误信息（不再 500）"""
+    """收到飞书回调后立即返回200（防止飞书因超时重试导致重复登记），
+    实际处理逻辑在后台线程执行。challenge 需同步返回（飞书验证URL用）。"""
+    import threading
+    raw = request.get_data(as_text=True)
+    # challenge 需同步返回（飞书验证URL时发challenge，不触发消息事件）
     try:
-        return _handle_webhook()
+        data_check = json.loads(raw) if raw else {}
+    except Exception:
+        data_check = {}
+    if "encrypt" in data_check and ENCRYPT_KEY:
+        try:
+            data_check = decrypt_payload(data_check["encrypt"])
+        except Exception:
+            pass
+    if "challenge" in data_check:
+        return jsonify({"challenge": data_check["challenge"]})
+    # 后台线程处理消息，立即返回200
+    threading.Thread(target=_process_in_background, args=(raw,), daemon=True).start()
+    return jsonify({"ok": True})
+
+
+def _process_in_background(raw):
+    """后台线程处理飞书消息：解析→下载图片→AI识别→写入表格→群回复。
+    所有异常发群里（不返回给飞书，因为已经返回200了）。"""
+    try:
+        _handle_webhook(raw)
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
-        # 把完整 traceback 发群里，精简到最后 800 字符（定位精确报错行）
         try:
             send_group_msg(f"处理异常: {str(e)[:200]}\n\n--- traceback ---\n{tb[-800:]}")
         except Exception:
             pass
-        return jsonify({"ok": False, "error": str(e), "traceback": tb[-800:]})
 
 
-def _handle_webhook():
-    raw = request.get_data(as_text=True)
+def _handle_webhook(raw):
     try:
         data = json.loads(raw) if raw else {}
     except Exception:
@@ -244,14 +264,14 @@ def _handle_webhook():
         except Exception:
             pass
     if "challenge" in data:
-        return jsonify({"challenge": data["challenge"]})
+        return  # challenge 已在 webhook 同步处理
     header = data.get("header", {})
     if header.get("event_type") != "im.message.receive_v1":
-        return jsonify({"ok": True})
+        return
     event = data.get("event", {})
     msg = event.get("message", {})
     if msg.get("message_type") != "post":
-        return jsonify({"ok": True})
+        return
     content_raw = msg.get("content", "{}")
     try:
         content = json.loads(content_raw) if content_raw else {}
@@ -282,7 +302,7 @@ def _handle_webhook():
                 text_parts.append(node.get("text", ""))
     full_text = "".join(text_parts)
     if not image_keys:
-        return jsonify({"ok": True, "msg": "no image"})
+        return  # 无图，后台线程直接结束
 
     # 从消息文字提取日期和账号（问题4：格式"时间+账号+直播数据"，文字覆盖图片识别）
     msg_date, msg_account = parse_text_meta(full_text)
@@ -388,9 +408,9 @@ def _handle_webhook():
     if total_ok:
         parts.append("请复查后改数据状态为已复查。")
     if not parts:
-        parts.append("识别完成但无有效数据写入（可能已重复登记或截图无有效数据）。")
+        parts.append("识别完成但无有效数据写入（可能已重复登件或截图无有效数据）。")
     send_group_msg("\n".join(parts))
-    return jsonify({"ok": True})
+    return  # 后台线程结束（已返回200给飞书）
 
 
 @app.route("/", methods=["GET"])
@@ -402,7 +422,7 @@ def index():
 def version():
     """版本和环境变量状态确认（排查部署问题用）"""
     return jsonify({
-        "version": "7.3",
+        "version": "7.4",
         "encrypt_key_set": bool(ENCRYPT_KEY),
         "app_id_set": bool(APP_ID),
         "app_secret_set": bool(APP_SECRET),
