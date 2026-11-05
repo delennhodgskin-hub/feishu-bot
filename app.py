@@ -391,6 +391,12 @@ def _handle_webhook(raw):
     # 预拉取表格已有记录用于去重（问题2、3：每天每人/每账号只一组，重复发消息不重复登记）
     existing = list_records(base, table)
 
+    # 统计变量初始化（必须在所有使用前定义，避免 UnboundLocalError/NameError）
+    total_ok = 0
+    skipped_dups = 0
+    errors = []
+    all_labels = []
+
     # 主播消息特殊处理：多张图可能是同一批主播的不同维度数据（基础数据+能力分析）
     # 需要按主播姓名合并到同一条记录，而非分开识别
     if is_anchor:
@@ -548,7 +554,7 @@ def index():
 def version():
     """版本和环境变量状态确认（排查部署问题用）"""
     return jsonify({
-        "version": "7.6",
+        "version": "7.7",
         "encrypt_key_set": bool(ENCRYPT_KEY),
         "app_id_set": bool(APP_ID),
         "app_secret_set": bool(APP_SECRET),
