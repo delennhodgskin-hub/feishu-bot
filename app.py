@@ -164,6 +164,119 @@ def upload_attachment(image_bytes, filename, base_token):
     return data.get("data", {}).get("file_token", "")
 
 
+def download_media(message_id, file_key):
+    """下载群消息里的视频/文件资源。
+    用消息资源接口 type=file（download_image 用 type=image 只能下图片）。"""
+    token = get_tenant_token()
+    r = requests.get(
+        f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{file_key}",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"type": "file"}, timeout=120)
+    if r.status_code != 200:
+        raise Exception(f"下载视频HTTP {r.status_code}: {r.text[:200]}")
+    return r.content
+
+
+def upload_video_to_drive(video_bytes, file_name):
+    """上传视频到飞书云空间根目录，返回 file_token 和可访问链接。"""
+    token = get_tenant_token()
+    size = len(video_bytes)
+    r = requests.post(
+        "https://open.feishu.cn/open-apis/drive/v1/files/upload_all",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"file_name": file_name, "parent_type": "explorer",
+              "parent_node": "", "size": str(size)},
+        files={"file": (file_name, video_bytes)},
+        timeout=180)
+    data = r.json()
+    if data.get("code") != 0:
+        raise Exception(f"视频上传云空间失败 code={data.get('code')}: {data.get('msg','')}")
+    file_token = data.get("data", {}).get("file_token", "")
+    # 飞书云空间文件链接格式
+    share_url = f"https://fcndv9la878k.feishu.cn/file/{file_token}"
+    return file_token, share_url
+
+
+def update_record(base, table, record_id, fields):
+    """更新飞书表格已有记录的部分字段（用于补充录屏链接）。"""
+    token = get_tenant_token()
+    r = requests.put(
+        f"https://open.feishu.cn/open-apis/bitable/v1/apps/{base}/tables/{table}/records/{record_id}",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={"fields": fields}, timeout=15)
+    data = r.json()
+    if data.get("code") != 0:
+        raise Exception(f"飞书更新失败 code={data.get('code')}: {data.get('msg','')}")
+    return data
+
+
+def _handle_recording(message_id, full_text, media_files):
+    """处理单独发送的录屏视频消息：下载视频→上传云空间→查找主播记录→更新录屏链接。
+    触发条件：消息无图片、含"录屏"关键词、有视频文件（media节点）。
+    文字格式如"@看数据 小琦 录屏"，从中提取主播名"小琦"。"""
+    import re
+    from datetime import datetime, timezone, timedelta
+    CST = timezone(timedelta(hours=8))
+
+    # 从文字提取主播名（去掉@用户名、去掉"录屏"关键词后的剩余文字）
+    anchor_name = full_text.replace("录屏", "").strip()
+    anchor_name = re.sub(r"@\S+", "", anchor_name).strip()
+    if not anchor_name:
+        send_group_msg("录屏处理：未识别到主播姓名，请在消息里写明主播名+录屏")
+        return
+
+    base = BASE_ANCHOR
+    table = TABLE_ANCHOR
+
+    for mf in media_files:
+        file_key = mf.get("file_key", "")
+        if not file_key:
+            continue
+        try:
+            # 1. 下载视频（消息资源接口 type=file）
+            video = download_media(message_id, file_key)
+            # 2. 上传到飞书云空间，获取 file_token 和分享链接
+            file_name = mf.get("file_name", "录屏.mp4")
+            if "." not in file_name:
+                file_name = file_name + ".mp4"
+            file_token, share_url = upload_video_to_drive(video, file_name)
+
+            # 3. 查找该主播今天的记录
+            existing = list_records(base, table)
+            today = datetime.now(CST).strftime("%Y-%m-%d")
+            updated = False
+            for rec in existing:
+                rec_fields = rec.get("fields", {})
+                rec_anchor = str(rec_fields.get("主播姓名", ""))
+                rec_date = rec_fields.get("数据日期", "")
+                # 日期是毫秒时间戳，转成 YYYY-MM-DD
+                if isinstance(rec_date, (int, float)) and rec_date > 1000000000:
+                    rec_date_str = datetime.fromtimestamp(rec_date / 1000, tz=CST).strftime("%Y-%m-%d")
+                else:
+                    rec_date_str = str(rec_date)[:10]
+
+                # 模糊匹配主播名 + 今天日期
+                if anchor_name in rec_anchor and today == rec_date_str:
+                    # 找到第一个空的录屏链接字段填入
+                    link_fields = ["录屏链接1", "录屏链接2", "录屏链接3"]
+                    update_data = {}
+                    for lf in link_fields:
+                        if not rec_fields.get(lf):
+                            update_data[lf] = share_url
+                            break
+                    if update_data:
+                        update_record(base, table, rec.get("record_id"), update_data)
+                        updated = True
+                        break
+
+            if updated:
+                send_group_msg(f"录屏已收集：主播 {anchor_name} 的录屏已登记到今日记录")
+            else:
+                send_group_msg(f"录屏已上传：{share_url}（未找到 {anchor_name} 今天的主播记录，请手动登记链接）")
+        except Exception as e:
+            send_group_msg(f"录屏处理失败({anchor_name}): {e}")
+
+
 def send_group_msg(text):
     try:
         token = get_tenant_token()
@@ -406,6 +519,11 @@ def _handle_webhook(raw):
         if fn and fn not in link_urls:
             link_urls.append(fn)
     if not image_keys:
+        # 无图片：可能是单独发送的录屏视频消息
+        # 如果消息含"录屏"关键词且有视频文件 → 走录屏收集流程
+        if media_files and "录屏" in full_text:
+            message_id = msg.get("message_id", "")
+            _handle_recording(message_id, full_text, media_files)
         return  # 无图，后台线程直接结束
 
     # 从消息文字提取日期和账号（问题4：格式"时间+账号+直播数据"，文字覆盖图片识别）
@@ -431,6 +549,10 @@ def _handle_webhook(raw):
                    "平均在线人数", "直播间曝光人数", "曝光-观看率", "直播间观看人数",
                    "商品曝光-点击率", "商品点击-成交转化率"}
 
+    # 百分比类型字段：飞书百分比字段存储小数(如0.1325表示13.25%)
+    # 智谱可能返回百分比数值(如13.25)，需除以100转成小数，否则飞书会显示1325%
+    PERCENT_FIELDS = {"退款金额占比", "曝光-观看率", "商品曝光-点击率", "商品点击-成交转化率", "留存率"}
+
     def build_fields(rec, ai_raw):
         """构造飞书 fields：数据日期转毫秒时间戳、文本转str、数字清洗。
         空值或清洗不出数字的字段跳过（留空待人工复查补），避免 NumberFieldConvFail。
@@ -453,7 +575,12 @@ def _handle_webhook(raw):
                 m = re.search(r"-?\d+\.?\d*", s)
                 if m:
                     num = m.group()
-                    f[k] = float(num) if "." in num else int(num)
+                    val = float(num) if "." in num else int(num)
+                    # 百分比字段：智谱可能返回百分比数值(如13.25)而非小数(0.1325)
+                    # 飞书百分比字段存储小数，值>1说明是百分比数值，需除以100
+                    if k in PERCENT_FIELDS and val > 1:
+                        val = val / 100
+                    f[k] = val
         f["数据状态"] = "草稿"
         f["AI识别结果"] = ai_raw
         return f
@@ -661,7 +788,7 @@ def index():
 def version():
     """版本和环境变量状态确认（排查部署问题用）"""
     return jsonify({
-        "version": "7.12",
+        "version": "7.13",
         "encrypt_key_set": bool(ENCRYPT_KEY),
         "app_id_set": bool(APP_ID),
         "app_secret_set": bool(APP_SECRET),
