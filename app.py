@@ -383,11 +383,24 @@ def _handle_webhook(raw):
     import re
     CST = timezone(timedelta(hours=8))  # 表格时区 Asia/Shanghai
 
+    # 表格字段白名单：只处理这些字段名，智谱返回的其他字段名一律忽略（避免 FieldNameNotFound）
+    if rtype_hint == "anchor":
+        allowed = {"主播姓名", "所属账号", "数据日期", "直播间用户支付金额", "单小时用户支付金额",
+                   "最高在线人数", "平均在线人数", "曝光-观看率", "留存率", "UV价值"}
+    else:
+        allowed = {"数据日期", "账号", "综合营销ROI", "整体消耗", "直播时长（min）",
+                   "直播间成交金额", "退款金额占比", "千次观看用户支付金额", "人均观看时长",
+                   "平均在线人数", "直播间曝光人数", "曝光-观看率", "直播间观看人数",
+                   "商品曝光-点击率", "商品点击-成交转化率"}
+
     def build_fields(rec, ai_raw):
         """构造飞书 fields：数据日期转毫秒时间戳、文本转str、数字清洗。
-        空值或清洗不出数字的字段跳过（留空待人工复查补），避免 NumberFieldConvFail。"""
+        空值或清洗不出数字的字段跳过（留空待人工复查补），避免 NumberFieldConvFail。
+        只处理白名单内字段名，避免智谱返回额外字段名导致 FieldNameNotFound。"""
         f = {}
         for k, v in rec.items():
+            if k not in allowed:
+                continue  # 非白名单字段一律跳过
             if k == "数据日期":
                 try:
                     f[k] = int(datetime.strptime(str(v)[:10], "%Y-%m-%d").replace(tzinfo=CST).timestamp() * 1000)
@@ -585,7 +598,7 @@ def index():
 def version():
     """版本和环境变量状态确认（排查部署问题用）"""
     return jsonify({
-        "version": "7.9",
+        "version": "7.10",
         "encrypt_key_set": bool(ENCRYPT_KEY),
         "app_id_set": bool(APP_ID),
         "app_secret_set": bool(APP_SECRET),
