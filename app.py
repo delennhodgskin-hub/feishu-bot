@@ -31,25 +31,44 @@ TABLE_LIVE = "tbl4Vmkv2B5zd2Cv"
 TABLE_ANCHOR = "tbljoPMRJvyzKupS"
 GROUP_CHAT = "oc_ecc73eac1ebd2fe694ef5b3d7687587f"
 
-PROMPT_LIVE = "识别这张抖音电商罗盘直播数据截图。返回JSON，字段：类型(填live)、数据日期(YYYY-MM-DD)、账号(佳能Canon数码旗舰店/Canon佳能摄影摄像旗舰店/汉印拍立得旗舰店)、直播间成交金额、用户支付金额、千次观看成交金额、成交人数、成交件数、转化率(小数)、商品点击-成交率(小数)、平均在线人数、曝光-进入率(小数)、人均观看时长(秒整数)、退款金额、退款金额占比(小数)、新增粉丝数。数值只返数字。只返JSON不要其他文字。"
+PROMPT_LIVE = """识别这张抖音电商直播数据截图（可能是巨量千川直播页、抖音电商罗盘直播大屏、或直播转化漏斗页）。
+首先看截图右上角的店铺名称，在JSON里填"店铺名"字段。
+返回JSON，字段：
+- 类型：固定填"live"
+- 店铺名：截图右上角显示的店铺名称（如"佳能Canon数码旗舰店"，如果看不清或没有就填空字符串""）
+- 数据日期：YYYY-MM-DD格式，如果图里没有就填空字符串""
+- 账号：佳能Canon数码旗舰店/Canon佳能摄影摄像旗舰店/汉印拍立得旗舰店
+- 综合营销ROI：数字（如48.34）
+- 整体消耗：数字（去¥和逗号）
+- 直播时长（min）：分钟数
+- 直播间成交金额：数字（去¥和逗号）
+- 退款金额占比：小数（如0.6505表示65.05%）
+- 千次观看用户支付金额：数字（去¥和逗号）
+- 人均观看时长：秒整数
+- 平均在线人数：整数
+- 直播间曝光人数：整数（如"37.64万"转成376400）
+- 曝光-观看率：小数（如0.1567表示15.67%）
+- 直播间观看人数：整数（如"5.9万"转成59000）
+- 商品曝光-点击率：小数（如0.1805表示18.05%）
+- 商品点击-成交转化率：小数（如0.0092表示0.92%）
+
+重要规则：
+1. 只返这张图里显示的指标，没有显示的指标填空字符串""
+2. 数值不要带¥、逗号、万、%等符号，"万"要换算成纯数字（如5.9万=59000）
+3. 只返JSON，不要任何其他文字、不要markdown代码块"""
 PROMPT_ANCHOR = """识别这张抖音电商罗盘主播分析数据截图。这是主播对比表，可能显示基础数据或能力分析数据。
 返回严格JSON格式（不要markdown代码块），字段：
 - 类型：固定填"anchor"
 - 数据日期：YYYY-MM-DD格式，如果图里没有就填空字符串""
 - 主播姓名：数组，每个主播一个元素（如["张三","李四"]）
 - 所属账号：数组，每个主播对应的账号
-- 引流-曝光观看率：数组，小数（如0.109表示10.9%）
+- 直播间用户支付金额：数组，数字（去逗号）
+- 单小时用户支付金额：数组，数字（去逗号）
+- 最高在线人数：数组，整数
+- 平均在线人数：数组，整数
+- 曝光-观看率：数组，小数（如0.1567表示15.67%）
 - 留存率：数组，小数
-- 观看互动率：数组，小数
-- 新增粉丝：数组，整数
-- 观看-关注率：数组，小数
-- 新增团人数：数组，整数
 - UV价值：数组，数字
-- 单小时支付金额：数组，数字（去逗号）
-- 最高在线：数组，整数
-- 平均在线：数组，整数
-- 平均客单价：数组，数字（去逗号）
-- 成交金额：数组，数字（去逗号）
 
 重要规则：
 1. 所有字段都返回数组（即使只有1个主播）
@@ -374,7 +393,7 @@ def _handle_webhook(raw):
                     f[k] = int(datetime.strptime(str(v)[:10], "%Y-%m-%d").replace(tzinfo=CST).timestamp() * 1000)
                 except Exception:
                     pass  # 空或格式不对则跳过（datetime 字段留空）
-            elif k in ("账号", "主播姓名", "所属账号", "人均观看时长"):
+            elif k in ("账号", "主播姓名", "所属账号", "人均观看时长", "直播时长（min）"):
                 if str(v).strip():
                     f[k] = str(v)
             else:
@@ -479,7 +498,11 @@ def _handle_webhook(raw):
             except Exception as e:
                 errors.append(f"写入失败({anchor_name}): {e}")
     else:
-        # 直播消息：每张图是一条独立记录（两张图=两场直播）
+        # 直播消息：多张图是同一场直播的不同页面数据（千川页/直播大屏/转化漏斗），
+        # 合并成一条记录，而非每张图独立一条
+        merged = {}  # 合并后的记录
+        ai_raws = []  # 所有图的AI原始返回
+        shop_names = []  # 各张图识别到的店铺名
         for idx, img_key in enumerate(image_keys):
             try:
                 img = download_image(message_id, img_key)
@@ -495,39 +518,47 @@ def _handle_webhook(raw):
             except Exception:
                 errors.append(f"第{idx+1}张图JSON解析失败: {ai_result[:120]}")
                 continue
+            # 收集店铺名用于核对
+            sn = str(result.get("店铺名", "")).strip()
+            if sn:
+                shop_names.append(sn)
+            result.pop("店铺名", None)
+            ai_raws.append(ai_result)
+            # 合并字段（后识别的补充先识别的空值）
+            for k, v in result.items():
+                existing_val = merged.get(k)
+                if existing_val is None or str(existing_val).strip() == "":
+                    merged[k] = v
 
-            # 用消息文字的日期/账号覆盖AI识别结果（问题4）
-            if msg_date:
-                result["数据日期"] = msg_date
-            if msg_account:
-                result["账号"] = msg_account
+        # 核对店铺名：如果AI识别的店铺名和消息文字的账号不一致，提醒人工核实
+        for sn in shop_names:
+            if msg_account and sn and msg_account not in sn and sn not in msg_account:
+                errors.append(f"店铺名核对警告：截图右上角'{sn}'与消息账号'{msg_account}'不一致，请人工核实")
+                break
 
-            rtype = result.pop("类型", rtype_hint)
+        # 用消息文字的日期/账号覆盖AI识别结果
+        if msg_date:
+            merged["数据日期"] = msg_date
+        if msg_account:
+            merged["账号"] = msg_account
+        merged.pop("类型", None)
 
-            # 多主播拆分：主播对比表一屏多主播，智谱返回数组，拆成多条
-            list_keys = [k for k, v in result.items() if isinstance(v, list)]
-            if list_keys:
-                n = max(len(result[k]) for k in list_keys)
-                records = [{} for _ in range(n)]
-                for k, v in result.items():
-                    for i in range(n):
-                        records[i][k] = v[i] if isinstance(v, list) and i < len(v) else v
+        # 写入合并后的直播记录
+        ai_raw_combined = "\n---\n".join(ai_raws) if ai_raws else ""
+        fields = build_fields(merged, ai_raw_combined)
+        if len(fields) <= 2:
+            if not errors:
+                errors.append("识别完成但无有效业务数据（截图可能无对应指标）")
+        else:
+            if is_duplicate(fields, existing, "live"):
+                skipped_dups += 1
             else:
-                records = [result]
-
-            for rec in records:
-                fields = build_fields(rec, ai_result)
-                if len(fields) <= 2:  # 只有数据状态+AI识别结果，无有效业务数据，跳过
-                    continue
-                if is_duplicate(fields, existing, rtype):
-                    skipped_dups += 1
-                    continue
                 try:
                     write_record(base, table, fields)
                     total_ok += 1
-                    all_labels.append(rec.get("账号") or rec.get("主播姓名") or "未命名")
+                    all_labels.append(merged.get("账号") or "未命名")
                 except Exception as e:
-                    errors.append(f"写入失败({rec.get('主播姓名') or rec.get('账号') or '?'}): {e}")
+                    errors.append(f"写入失败: {e}")
 
     # 汇总群回复
     parts = []
@@ -554,7 +585,7 @@ def index():
 def version():
     """版本和环境变量状态确认（排查部署问题用）"""
     return jsonify({
-        "version": "7.7",
+        "version": "7.9",
         "encrypt_key_set": bool(ENCRYPT_KEY),
         "app_id_set": bool(APP_ID),
         "app_secret_set": bool(APP_SECRET),
