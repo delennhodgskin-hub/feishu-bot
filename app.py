@@ -49,8 +49,8 @@ PROMPT_LIVE = """识别这张抖音电商直播数据截图（可能是巨量千
 - 直播间曝光人数：整数（如"37.64万"转成376400）
 - 曝光-观看率：小数（如0.1567表示15.67%）
 - 直播间观看人数：整数（如"5.9万"转成59000）
-- 商品曝光-点击率：小数（如0.1805表示18.05%）
-- 商品点击-成交转化率：小数（如0.0092表示0.92%）
+- 商品曝光-点击率：小数，指商品曝光后用户点击的比例（转化漏斗"商品曝光→商品点击"那层的转化率，约18%，注意不要和"观看→商品曝光"的转化率约76%混淆）
+- 商品点击-成交转化率：小数，指商品点击后成交的比例（转化漏斗"商品点击→成交"那层的转化率，约0.92%）
 
 重要规则：
 1. 只返这张图里显示的指标，没有显示的指标填空字符串""
@@ -141,6 +141,27 @@ def write_record(base, table, fields):
     if data.get("code") != 0:
         raise Exception(f"飞书写入失败 code={data.get('code')}: {data.get('msg','')}")
     return data
+
+
+def upload_attachment(image_bytes, filename, base_token):
+    """上传图片到飞书表格附件字段，返回 file_token。
+    用 drive/v1/medias/upload_all 接口，parent_type=bitable_file。"""
+    token = get_tenant_token()
+    fmt = detect_image_format(image_bytes)
+    if not filename.endswith(f".{fmt}"):
+        filename = filename.rsplit(".", 1)[0] + f".{fmt}"
+    size = len(image_bytes)
+    r = requests.post(
+        "https://open.feishu.cn/open-apis/drive/v1/medias/upload_all",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"file_name": filename, "parent_type": "bitable_file",
+              "parent_node": base_token, "size": str(size)},
+        files={"file": (filename, image_bytes)},
+        timeout=30)
+    data = r.json()
+    if data.get("code") != 0:
+        raise Exception(f"上传附件失败 code={data.get('code')}: {data.get('msg','')}")
+    return data.get("data", {}).get("file_token", "")
 
 
 def send_group_msg(text):
@@ -515,7 +536,8 @@ def _handle_webhook(raw):
         # 合并成一条记录，而非每张图独立一条
         merged = {}  # 合并后的记录
         ai_raws = []  # 所有图的AI原始返回
-        shop_names = []  # 各张图识别到的店铺名
+        shop_names = []  # 各张图识别到店铺名
+        attachment_tokens = []  # 各张图上传附件后的file_token
         for idx, img_key in enumerate(image_keys):
             try:
                 img = download_image(message_id, img_key)
@@ -537,6 +559,13 @@ def _handle_webhook(raw):
                 shop_names.append(sn)
             result.pop("店铺名", None)
             ai_raws.append(ai_result)
+            # 上传图片到飞书表格附件（收集每天3张直播截图）
+            try:
+                ft = upload_attachment(img, f"直播截图{idx+1}", base)
+                if ft:
+                    attachment_tokens.append(ft)
+            except Exception as e:
+                errors.append(f"第{idx+1}张图上传附件失败: {e}")
             # 合并字段（后识别的补充先识别的空值）
             for k, v in result.items():
                 existing_val = merged.get(k)
@@ -559,6 +588,9 @@ def _handle_webhook(raw):
         # 写入合并后的直播记录
         ai_raw_combined = "\n---\n".join(ai_raws) if ai_raws else ""
         fields = build_fields(merged, ai_raw_combined)
+        # 把每天3张直播截图作为附件写入"截图附件"字段
+        if attachment_tokens:
+            fields["截图附件"] = [{"file_token": t} for t in attachment_tokens]
         if len(fields) <= 2:
             if not errors:
                 errors.append("识别完成但无有效业务数据（截图可能无对应指标）")
@@ -598,7 +630,7 @@ def index():
 def version():
     """版本和环境变量状态确认（排查部署问题用）"""
     return jsonify({
-        "version": "7.10",
+        "version": "7.11",
         "encrypt_key_set": bool(ENCRYPT_KEY),
         "app_id_set": bool(APP_ID),
         "app_secret_set": bool(APP_SECRET),
