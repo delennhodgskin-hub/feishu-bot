@@ -376,18 +376,35 @@ def _handle_webhook(raw):
     content_rows = post_obj.get("content") or []
     if not isinstance(content_rows, list):
         content_rows = []
-    image_keys, text_parts = [], []
+    image_keys, text_parts, link_urls, media_files = [], [], [], []
     for row in content_rows:
         if not isinstance(row, list):
             continue
         for node in row:
             if not isinstance(node, dict):
                 continue
-            if node.get("tag") == "img":
+            tag = node.get("tag")
+            if tag == "img":
                 image_keys.append(node.get("image_key"))
-            elif node.get("tag") == "text":
+            elif tag == "text":
                 text_parts.append(node.get("text", ""))
+            elif tag == "a":
+                href = node.get("href", "")
+                if href:
+                    link_urls.append(href)
+            elif tag in ("media", "video", "file"):
+                media_files.append({"file_key": node.get("file_key", ""), "file_name": node.get("file_name", "")})
     full_text = "".join(text_parts)
+    # 从文字里提取URL（录屏链接可能以纯文字形式发送）
+    import re as _re
+    for u in _re.findall(r'https?://[^\s，,\）\)]+', full_text):
+        if u not in link_urls:
+            link_urls.append(u)
+    # 视频文件名也作为录屏链接的候选（占位，后续用户可替换成分享链接）
+    for mf in media_files:
+        fn = mf.get("file_name", "")
+        if fn and fn not in link_urls:
+            link_urls.append(fn)
     if not image_keys:
         return  # 无图，后台线程直接结束
 
@@ -455,6 +472,7 @@ def _handle_webhook(raw):
     if is_anchor:
         # 收集所有图片的识别结果
         all_anchor_results = []
+        anchor_attachment_tokens = []  # 主播截图附件file_token
         for idx, img_key in enumerate(image_keys):
             try:
                 img = download_image(message_id, img_key)
@@ -470,6 +488,13 @@ def _handle_webhook(raw):
             except Exception:
                 errors.append(f"第{idx+1}张图JSON解析失败: {ai_result[:120]}")
                 continue
+            # 上传主播截图到飞书表格附件
+            try:
+                ft = upload_attachment(img, f"主播截图{idx+1}", base)
+                if ft:
+                    anchor_attachment_tokens.append(ft)
+            except Exception as e:
+                errors.append(f"第{idx+1}张图上传附件失败: {e}")
             # 用消息文字的日期/账号覆盖
             if msg_date:
                 result["数据日期"] = msg_date
@@ -520,6 +545,12 @@ def _handle_webhook(raw):
             ai_raw = rec.pop("_ai_raw", "")
             rec["主播姓名"] = anchor_name
             fields = build_fields(rec, ai_raw)
+            # 主播截图附件（所有主播记录都放同一组截图）
+            if anchor_attachment_tokens:
+                fields["截图附件"] = [{"file_token": t} for t in anchor_attachment_tokens]
+            # 录屏链接（从消息里提取的URL/文件名，分别放入录屏链接1/2/3）
+            for i, url in enumerate(link_urls[:3]):
+                fields[f"录屏链接{i+1}"] = url
             if len(fields) <= 2:
                 continue
             if is_duplicate(fields, existing, "anchor"):
@@ -630,7 +661,7 @@ def index():
 def version():
     """版本和环境变量状态确认（排查部署问题用）"""
     return jsonify({
-        "version": "7.11",
+        "version": "7.12",
         "encrypt_key_set": bool(ENCRYPT_KEY),
         "app_id_set": bool(APP_ID),
         "app_secret_set": bool(APP_SECRET),
