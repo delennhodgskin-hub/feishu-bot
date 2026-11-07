@@ -211,9 +211,11 @@ def update_record(base, table, record_id, fields):
 
 
 def _handle_recording(message_id, full_text, media_files):
-    """处理单独发送的录屏视频消息：下载视频→上传云空间→查找主播记录→更新录屏链接。
+    """处理单独发送的录屏视频消息：生成飞书消息跳转链接→查找主播记录→更新录屏链接。
     触发条件：消息无图片、含"录屏"关键词、有视频文件（media节点）。
-    文字格式如"@看数据 小琦 录屏"，从中提取主播名"小琦"。"""
+    文字格式如"@看数据 小琦 录屏"，从中提取主播名"小琦"。
+    注意：视频文件通常>25MB，飞书消息资源接口无法下载（code=234037），
+    改用 applink 生成消息跳转链接，用户点击在飞书客户端打开视频。"""
     import re
     from datetime import datetime, timezone, timedelta
     CST = timezone(timedelta(hours=8))
@@ -228,53 +230,69 @@ def _handle_recording(message_id, full_text, media_files):
     base = BASE_ANCHOR
     table = TABLE_ANCHOR
 
-    for mf in media_files:
-        file_key = mf.get("file_key", "")
-        if not file_key:
-            continue
-        try:
-            # 1. 下载视频（消息资源接口 type=file）
-            video = download_media(message_id, file_key)
-            # 2. 上传到飞书云空间，获取 file_token 和分享链接
-            file_name = mf.get("file_name", "录屏.mp4")
-            if "." not in file_name:
-                file_name = file_name + ".mp4"
-            file_token, share_url = upload_video_to_drive(video, file_name)
+    # 视频文件>25MB无法通过消息资源接口下载（飞书限制234037），
+    # 改用飞书 applink 生成消息跳转链接，用户点击在飞书客户端打开视频
+    share_url = f"https://applink.feishu.cn/client/message?chat_id={GROUP_CHAT}&message_id={message_id}"
 
-            # 3. 查找该主播今天的记录
-            existing = list_records(base, table)
-            today = datetime.now(CST).strftime("%Y-%m-%d")
-            updated = False
-            for rec in existing:
-                rec_fields = rec.get("fields", {})
-                rec_anchor = str(rec_fields.get("主播姓名", ""))
-                rec_date = rec_fields.get("数据日期", "")
-                # 日期是毫秒时间戳，转成 YYYY-MM-DD
-                if isinstance(rec_date, (int, float)) and rec_date > 1000000000:
-                    rec_date_str = datetime.fromtimestamp(rec_date / 1000, tz=CST).strftime("%Y-%m-%d")
-                else:
-                    rec_date_str = str(rec_date)[:10]
+    try:
+        # 查找该主播的记录
+        existing = list_records(base, table)
 
-                # 模糊匹配主播名 + 今天日期
-                if anchor_name in rec_anchor and today == rec_date_str:
-                    # 找到第一个空的录屏链接字段填入
-                    link_fields = ["录屏链接1", "录屏链接2", "录屏链接3"]
-                    update_data = {}
-                    for lf in link_fields:
-                        if not rec_fields.get(lf):
-                            update_data[lf] = share_url
-                            break
-                    if update_data:
-                        update_record(base, table, rec.get("record_id"), update_data)
-                        updated = True
-                        break
+        # 按日期降序排序（最新在前）
+        def _date_val(rec):
+            d = rec.get("fields", {}).get("数据日期", "")
+            if isinstance(d, (int, float)) and d > 1000000000:
+                return d
+            return 0
+        existing_sorted = sorted(existing, key=_date_val, reverse=True)
 
-            if updated:
-                send_group_msg(f"录屏已收集：主播 {anchor_name} 的录屏已登记到今日记录")
+        today = datetime.now(CST).strftime("%Y-%m-%d")
+        target_rec = None
+
+        # 先找今天的
+        for rec in existing_sorted:
+            rec_fields = rec.get("fields", {})
+            rec_anchor = str(rec_fields.get("主播姓名", ""))
+            rec_date = rec_fields.get("数据日期", "")
+            if isinstance(rec_date, (int, float)) and rec_date > 1000000000:
+                rec_date_str = datetime.fromtimestamp(rec_date / 1000, tz=CST).strftime("%Y-%m-%d")
             else:
-                send_group_msg(f"录屏已上传：{share_url}（未找到 {anchor_name} 今天的主播记录，请手动登记链接）")
-        except Exception as e:
-            send_group_msg(f"录屏处理失败({anchor_name}): {e}")
+                rec_date_str = str(rec_date)[:10]
+            if anchor_name in rec_anchor and today == rec_date_str:
+                target_rec = rec
+                break
+
+        # 今天没找到，找该主播最近一条记录
+        if not target_rec:
+            for rec in existing_sorted:
+                rec_anchor = str(rec.get("fields", {}).get("主播姓名", ""))
+                if anchor_name in rec_anchor:
+                    target_rec = rec
+                    break
+
+        if target_rec:
+            rec_fields = target_rec.get("fields", {})
+            # 找到第一个空的录屏链接字段填入
+            link_fields = ["录屏链接1", "录屏链接2", "录屏链接3"]
+            update_data = {}
+            for lf in link_fields:
+                if not rec_fields.get(lf):
+                    update_data[lf] = share_url
+                    break
+            if update_data:
+                update_record(base, table, target_rec.get("record_id"), update_data)
+                updated = True
+            else:
+                # 3个录屏链接都满了，覆盖第一个
+                update_record(base, table, target_rec.get("record_id"), {"录屏链接1": share_url})
+                updated = True
+
+        if updated:
+            send_group_msg(f"录屏已收集：主播 {anchor_name} 的录屏链接已登记到今日记录（点击链接可在飞书查看视频）")
+        else:
+            send_group_msg(f"录屏已登记链接：{share_url}（未找到 {anchor_name} 的主播记录，请手动登记）")
+    except Exception as e:
+        send_group_msg(f"录屏处理失败({anchor_name}): {e}")
 
 
 def send_group_msg(text):
@@ -788,7 +806,7 @@ def index():
 def version():
     """版本和环境变量状态确认（排查部署问题用）"""
     return jsonify({
-        "version": "7.13",
+        "version": "7.14",
         "encrypt_key_set": bool(ENCRYPT_KEY),
         "app_id_set": bool(APP_ID),
         "app_secret_set": bool(APP_SECRET),
