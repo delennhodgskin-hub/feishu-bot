@@ -230,9 +230,10 @@ def _handle_recording(message_id, full_text, media_files):
     base = BASE_ANCHOR
     table = TABLE_ANCHOR
 
-    # 视频文件>25MB无法通过消息资源接口下载（飞书限制234037），
-    # 改用飞书 applink 生成消息跳转链接，用户点击在飞书客户端打开视频
-    share_url = f"https://applink.feishu.cn/client/message?chat_id={GROUP_CHAT}&message_id={message_id}"
+    # 视频文件>25MB无法下载，applink格式也无效（飞书显示"此页面无效"）
+    # 改用"回复录屏消息"方案：回复消息引用原视频消息，用户在飞书客户端点击引用即可查看视频
+    # 表格里存录屏消息的 message_id（如 om_xxx），后续可通过"查看录屏"命令重新调出视频引用
+    recording_id = message_id  # 存 message_id，用于后续查看录屏时回复引用该消息
 
     try:
         # 查找该主播的记录
@@ -277,22 +278,148 @@ def _handle_recording(message_id, full_text, media_files):
             update_data = {}
             for lf in link_fields:
                 if not rec_fields.get(lf):
-                    update_data[lf] = share_url
+                    update_data[lf] = recording_id
                     break
             if update_data:
                 update_record(base, table, target_rec.get("record_id"), update_data)
                 updated = True
             else:
                 # 3个录屏链接都满了，覆盖第一个
-                update_record(base, table, target_rec.get("record_id"), {"录屏链接1": share_url})
+                update_record(base, table, target_rec.get("record_id"), {"录屏链接1": recording_id})
                 updated = True
 
         if updated:
-            send_group_msg(f"录屏已收集：主播 {anchor_name} 的录屏链接已登记到今日记录（点击链接可在飞书查看视频）")
+            # 回复录屏消息（引用原视频消息），用户在飞书客户端点击引用即可查看视频
+            reply_message(message_id, f"✅ 录屏已收集：主播 {anchor_name} 的录屏已登记到主播记录\n（点击上方引用消息可查看视频）")
         else:
-            send_group_msg(f"录屏已登记链接：{share_url}（未找到 {anchor_name} 的主播记录，请手动登记）")
+            send_group_msg(f"录屏未找到 {anchor_name} 的主播记录，请先登记主播数据再发录屏")
     except Exception as e:
         send_group_msg(f"录屏处理失败({anchor_name}): {e}")
+
+
+def _handle_view_recording(message_id, full_text):
+    """处理"查看录屏"命令：从主播表查找该主播该日期的录屏 message_id → 回复引用该视频消息。
+    支持的命令格式：
+      @看数据 查看录屏 小琦              → 查看小琦最近的录屏
+      @看数据 查看录屏 小琦 11-05        → 查看小琦11月5日的录屏
+      @看数据 查看录屏 小琦 2026-11-05   → 查看小琦2026年11月5日的录屏
+    表格"录屏链接1/2/3"字段里存的是录屏消息的 message_id（om_xxx）。"""
+    import re
+    from datetime import datetime, timezone, timedelta
+    CST = timezone(timedelta(hours=8))
+
+    # 从文字提取主播名和日期
+    # 去掉"查看录屏"关键词和@用户名
+    text = full_text.replace("查看录屏", "").replace("录屏", "")
+    text = re.sub(r"@\S+", "", text).strip()
+
+    # 提取日期（如果有）
+    target_date = None
+    # 完整日期 2026-11-05
+    m = re.search(r"(20\d{2})[.\-/](\d{1,2})[.\-/](\d{1,2})", text)
+    if m:
+        y, mo, d = m.groups()
+        target_date = f"{y}-{int(mo):02d}-{int(d):02d}"
+        text = text[:m.start()] + text[m.end():]
+    else:
+        # 月日 11-05 / 11.5
+        m = re.search(r"(?<!\d)(\d{1,2})[.\-/](\d{1,2})(?!\d)", text)
+        if m:
+            mo, d = m.groups()
+            y = datetime.now(CST).year
+            target_date = f"{y}-{int(mo):02d}-{int(d):02d}"
+            text = text[:m.start()] + text[m.end():]
+
+    anchor_name = text.strip()
+    if not anchor_name:
+        reply_message(message_id, "查看录屏：请在消息里写明主播名，格式如\"查看录屏 小琦\"或\"查看录屏 小琦 11-05\"")
+        return
+
+    base = BASE_ANCHOR
+    table = TABLE_ANCHOR
+
+    try:
+        existing = list_records(base, table)
+
+        # 按日期降序排序（最新在前）
+        def _date_val(rec):
+            d = rec.get("fields", {}).get("数据日期", "")
+            if isinstance(d, (int, float)) and d > 1000000000:
+                return d
+            return 0
+        existing_sorted = sorted(existing, key=_date_val, reverse=True)
+
+        target_rec = None
+
+        if target_date:
+            # 指定了日期：精确匹配该主播该日期
+            for rec in existing_sorted:
+                rec_fields = rec.get("fields", {})
+                rec_anchor = str(rec_fields.get("主播姓名", ""))
+                rec_date = rec_fields.get("数据日期", "")
+                if isinstance(rec_date, (int, float)) and rec_date > 1000000000:
+                    rec_date_str = datetime.fromtimestamp(rec_date / 1000, tz=CST).strftime("%Y-%m-%d")
+                else:
+                    rec_date_str = str(rec_date)[:10]
+                if anchor_name in rec_anchor and target_date == rec_date_str:
+                    target_rec = rec
+                    break
+        else:
+            # 未指定日期：找该主播最近一条有录屏的记录
+            for rec in existing_sorted:
+                rec_anchor = str(rec.get("fields", {}).get("主播姓名", ""))
+                if anchor_name in rec_anchor:
+                    # 检查是否有录屏 message_id
+                    has_recording = False
+                    for lf in ["录屏链接1", "录屏链接2", "录屏链接3"]:
+                        val = str(rec.get("fields", {}).get(lf, ""))
+                        if val and val.startswith("om_"):
+                            has_recording = True
+                            break
+                    if has_recording:
+                        target_rec = rec
+                        break
+                    # 没有录屏但匹配主播，先记住（作为备选）
+                    if not target_rec:
+                        target_rec = rec
+
+        if not target_rec:
+            reply_message(message_id, f"未找到主播 {anchor_name} 的记录，请确认主播名是否正确")
+            return
+
+        rec_fields = target_rec.get("fields", {})
+        rec_anchor = str(rec_fields.get("主播姓名", ""))
+        rec_date = rec_fields.get("数据日期", "")
+        if isinstance(rec_date, (int, float)) and rec_date > 1000000000:
+            rec_date_str = datetime.fromtimestamp(rec_date / 1000, tz=CST).strftime("%Y-%m-%d")
+        else:
+            rec_date_str = str(rec_date)[:10] if rec_date else "未知日期"
+
+        # 查找录屏 message_id（录屏链接1/2/3 里以 om_ 开头的值）
+        recording_msg_id = None
+        recording_idx = 0
+        for idx, lf in enumerate(["录屏链接1", "录屏链接2", "录屏链接3"], 1):
+            val = str(rec_fields.get(lf, ""))
+            if val and val.startswith("om_"):
+                recording_msg_id = val
+                recording_idx = idx
+                break
+
+        if not recording_msg_id:
+            reply_message(message_id, f"主播 {rec_anchor}（{rec_date_str}）没有登记录屏，请先发送录屏视频")
+            return
+
+        # 回复引用录屏消息（用户点击引用即可查看视频）
+        reply_message(
+            recording_msg_id,
+            f"📹 录屏回看：主播 {rec_anchor}（{rec_date_str}）的录屏\n"
+            f"（点击上方引用消息可查看/播放视频）"
+        )
+        # 同时回复当前命令消息，告知已调出录屏
+        reply_message(message_id, f"已调出主播 {rec_anchor}（{rec_date_str}）的录屏，请查看上方引用消息")
+
+    except Exception as e:
+        reply_message(message_id, f"查看录屏失败({anchor_name}): {e}")
 
 
 def send_group_msg(text):
@@ -306,6 +433,45 @@ def send_group_msg(text):
                   "content": json.dumps({"text": text})}, timeout=15)
     except Exception:
         pass  # 发群消息失败不阻断主流程，避免 500
+
+
+def send_card_msg(title, content, button_text, button_url, template="green"):
+    """发送带按钮的卡片消息到群（用于录屏收集成功后发"查看录屏"按钮）。"""
+    try:
+        token = get_tenant_token()
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {"title": {"tag": "plain_text", "content": title}, "template": template},
+            "elements": [
+                {"tag": "div", "text": {"tag": "lark_md", "content": content}},
+                {"tag": "action", "actions": [
+                    {"tag": "button", "text": {"tag": "plain_text", "content": button_text},
+                     "type": "primary", "url": button_url}
+                ]}
+            ]
+        }
+        requests.post(
+            "https://open.feishu.cn/open-apis/im/v1/messages",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            params={"receive_id_type": "chat_id"},
+            json={"receive_id": GROUP_CHAT, "msg_type": "interactive",
+                  "content": json.dumps(card)}, timeout=15)
+    except Exception:
+        pass
+
+
+def reply_message(message_id, text):
+    """回复群消息（引用原消息），用于录屏收集后回复录屏消息。
+    回复消息会引用原消息（视频），用户在飞书客户端点击引用部分即可查看/播放视频。"""
+    try:
+        token = get_tenant_token()
+        requests.post(
+            f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reply",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"msg_type": "text", "content": json.dumps({"text": text})},
+            timeout=15)
+    except Exception:
+        pass
 
 
 ACCOUNTS = ["佳能Canon数码旗舰店", "Canon佳能摄影摄像旗舰店", "汉印拍立得旗舰店"]
@@ -536,6 +702,13 @@ def _handle_webhook(raw):
         fn = mf.get("file_name", "")
         if fn and fn not in link_urls:
             link_urls.append(fn)
+
+    # 优先检查"查看录屏"命令（纯文字消息，优先级最高）
+    if "查看录屏" in full_text:
+        message_id = msg.get("message_id", "")
+        _handle_view_recording(message_id, full_text)
+        return  # 查看录屏命令处理完直接结束
+
     if not image_keys:
         # 无图片：可能是单独发送的录屏视频消息
         # 如果消息含"录屏"关键词且有视频文件 → 走录屏收集流程
@@ -806,7 +979,7 @@ def index():
 def version():
     """版本和环境变量状态确认（排查部署问题用）"""
     return jsonify({
-        "version": "7.14",
+        "version": "7.17",
         "encrypt_key_set": bool(ENCRYPT_KEY),
         "app_id_set": bool(APP_ID),
         "app_secret_set": bool(APP_SECRET),
