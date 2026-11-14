@@ -211,218 +211,161 @@ def update_record(base, table, record_id, fields):
     return data
 
 
-def _handle_recording(message_id, full_text, media_files):
-    """处理单独发送的录屏视频消息：生成飞书消息跳转链接→查找主播记录→更新录屏链接。
-    触发条件：消息无图片、含"录屏"关键词、有视频文件（media节点）。
-    文字格式如"@看数据 小琦 录屏"，从中提取主播名"小琦"。
-    注意：视频文件通常>25MB，飞书消息资源接口无法下载（code=234037），
-    改用 applink 生成消息跳转链接，用户点击在飞书客户端打开视频。"""
+def parse_recording_command(full_text, current_year=None):
+    """解析日期、账号、主播姓名和录屏序号；不把命令文字混入姓名。"""
     import re
+    import unicodedata
     from datetime import datetime, timezone, timedelta
-    CST = timezone(timedelta(hours=8))
 
-    # 从文字提取主播名（去掉@用户名、去掉"录屏"关键词后的剩余文字）
-    anchor_name = full_text.replace("录屏", "").strip()
-    anchor_name = re.sub(r"@\S+", "", anchor_name).strip()
-    if not anchor_name:
-        send_group_msg("录屏处理：未识别到主播姓名，请在消息里写明主播名+录屏")
-        return
+    text = unicodedata.normalize("NFKC", full_text).strip()
+    text = re.sub(r"@\S+", "", text).strip()
+    target_date = None
+    date_pattern = r"(?<!\d)(?:(20\d{2})[.\-/年])?(\d{1,2})[.\-/月](\d{1,2})(?:日)?(?!\d)"
+    dates = list(re.finditer(date_pattern, text))
+    if len(dates) > 1:
+        raise ValueError("请只写一个录屏日期，例如 2026-11-11。")
+    if dates:
+        match = dates[0]
+        year, month, day = match.groups()
+        year = int(year or current_year or datetime.now(timezone(timedelta(hours=8))).year)
+        try:
+            target_date = datetime(year, int(month), int(day)).strftime("%Y-%m-%d")
+        except ValueError:
+            raise ValueError("录屏日期无效，请使用真实日期，例如 2026-11-11。") from None
+        text = text[:match.start()] + " " + text[match.end():]
 
-    base = BASE_ANCHOR
-    table = TABLE_ANCHOR
+    account = None
+    account_names = sorted(
+        set(ACCOUNTS + [keyword for keyword, _ in ACCOUNT_KEYWORDS]),
+        key=len, reverse=True)
+    for name in account_names:
+        if name in text:
+            _, found = parse_text_meta(name)
+            if account and account != found:
+                raise ValueError("一条录屏消息只能指定一个账号。")
+            account = found
+            text = text.replace(name, " ")
 
-    # 视频文件>25MB无法下载，applink格式也无效（飞书显示"此页面无效"）
-    # 改用"回复录屏消息"方案：回复消息引用原视频消息，用户在飞书客户端点击引用即可查看视频
-    # 表格里存录屏消息的 message_id（如 om_xxx），后续可通过"查看录屏"命令重新调出视频引用
-    recording_id = message_id  # 存 message_id，用于后续查看录屏时回复引用该消息
+    slots = re.findall(r"录屏\s*(?:第\s*)?(\d+|[一二三四五六七八九十]+)\s*(?:段|号|个)?", text)
+    if len(slots) > 1:
+        raise ValueError("一条消息请只指定一个录屏序号。")
+    slot = None
+    if slots:
+        slot = {"一": 1, "二": 2, "三": 3}.get(slots[0])
+        if slot is None and slots[0].isdigit():
+            slot = int(slots[0])
+        if slot not in (1, 2, 3):
+            raise ValueError("录屏序号只能是 1、2 或 3。")
+    text = re.sub(r"的\s*(?=录屏)", "", text)
+    text = re.sub(r"录屏\s*(?:第\s*)?(?:\d+|[一二三四五六七八九十]+)\s*(?:段|号|个)?", " ", text)
+    text = text.replace("录屏", " ")
+    text = re.sub(r"^\s*(?:(?:请|帮我|记录|登记|收集|上传|保存|查看|查询|回看)\s*)+", "", text)
+    text = re.sub(r"(?:主播姓名|主播|账号)\s*[:：]?", " ", text)
+    anchor_name = re.sub(r"\s+", "", text).strip(",:：，。;；")
+    if not anchor_name or not re.fullmatch(r"[\u4e00-\u9fffA-Za-z0-9·._-]+", anchor_name):
+        raise ValueError("未识别到主播姓名，请写“记录11.11刘雅菊录屏1”并附上视频。")
+    return {"anchor_name": anchor_name, "date": target_date, "account": account, "slot": slot}
 
+
+def recording_date(value):
+    """统一表格日期；按北京时间解释毫秒时间戳。"""
+    from datetime import datetime, timezone, timedelta
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value / 1000, tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+    text = field_text(value).strip()
+    if text.isdigit() and len(text) >= 12:
+        return recording_date(int(text))
+    return text[:10]
+
+
+def recording_links(fields):
+    return [(slot, field_text(fields.get(f"录屏链接{slot}")).strip()) for slot in (1, 2, 3)]
+
+
+def select_recording_record(existing, command, for_view=False):
+    """姓名精确匹配；显式日期不回退；多账号或多条同日记录不猜测。"""
+    candidates = []
+    for record in existing:
+        fields = record.get("fields", {})
+        if field_text(fields.get("主播姓名")).strip() != command["anchor_name"]:
+            continue
+        if command["account"] and field_text(fields.get("所属账号")).strip() != command["account"]:
+            continue
+        if command["date"] and recording_date(fields.get("数据日期")) != command["date"]:
+            continue
+        candidates.append(record)
+    if not candidates:
+        when = command["date"] or "已有日期"
+        raise ValueError(f"未找到 {command['anchor_name']}（{when}）的主播记录，请先登记该日期的主播数据。")
+    accounts = {field_text(r.get("fields", {}).get("所属账号")).strip() for r in candidates}
+    if not command["account"] and len(accounts) > 1:
+        raise ValueError("该主播有多个账号的记录，请在命令中补充账号名称。")
+    if not command["date"]:
+        if for_view:
+            with_video = [r for r in candidates if any(
+                value.startswith("om_") and (command["slot"] is None or slot == command["slot"])
+                for slot, value in recording_links(r.get("fields", {})))]
+            if with_video:
+                candidates = with_video
+        newest = max(recording_date(r.get("fields", {}).get("数据日期")) for r in candidates)
+        candidates = [r for r in candidates if recording_date(r.get("fields", {}).get("数据日期")) == newest]
+    if len(candidates) != 1:
+        raise ValueError("同一主播、账号和日期有多条记录，请先核对表格，录屏未写入。")
+    record = candidates[0]
+    if not record.get("record_id"):
+        raise ValueError("主播记录缺少记录 ID，录屏未写入。")
+    return record
+
+
+def _handle_recording(message_id, full_text, media_files):
+    """保存原视频消息 ID；精确绑定日期/主播/账号，按序号登记且不覆盖已有录屏。"""
+    saved_label = None
     try:
-        # 查找该主播的记录
-        existing = list_records(base, table)
-
-        # 按日期降序排序（最新在前）
-        def _date_val(rec):
-            d = rec.get("fields", {}).get("数据日期", "")
-            if isinstance(d, (int, float)) and d > 1000000000:
-                return d
-            return 0
-        existing_sorted = sorted(existing, key=_date_val, reverse=True)
-
-        today = datetime.now(CST).strftime("%Y-%m-%d")
-        target_rec = None
-
-        # 先找今天的
-        for rec in existing_sorted:
-            rec_fields = rec.get("fields", {})
-            rec_anchor = str(rec_fields.get("主播姓名", ""))
-            rec_date = rec_fields.get("数据日期", "")
-            if isinstance(rec_date, (int, float)) and rec_date > 1000000000:
-                rec_date_str = datetime.fromtimestamp(rec_date / 1000, tz=CST).strftime("%Y-%m-%d")
-            else:
-                rec_date_str = str(rec_date)[:10]
-            if anchor_name in rec_anchor and today == rec_date_str:
-                target_rec = rec
-                break
-
-        # 今天没找到，找该主播最近一条记录
-        if not target_rec:
-            for rec in existing_sorted:
-                rec_anchor = str(rec.get("fields", {}).get("主播姓名", ""))
-                if anchor_name in rec_anchor:
-                    target_rec = rec
-                    break
-
-        if target_rec:
-            rec_fields = target_rec.get("fields", {})
-            # 找到第一个空的录屏链接字段填入
-            link_fields = ["录屏链接1", "录屏链接2", "录屏链接3"]
-            update_data = {}
-            for lf in link_fields:
-                if not rec_fields.get(lf):
-                    update_data[lf] = recording_id
-                    break
-            if update_data:
-                update_record(base, table, target_rec.get("record_id"), update_data)
-                updated = True
-            else:
-                # 3个录屏链接都满了，覆盖第一个
-                update_record(base, table, target_rec.get("record_id"), {"录屏链接1": recording_id})
-                updated = True
-
-        if updated:
-            # 回复录屏消息（引用原视频消息），用户在飞书客户端点击引用即可查看视频
-            reply_message(message_id, f"✅ 录屏已收集：主播 {anchor_name} 的录屏已登记到主播记录\n（点击上方引用消息可查看视频）")
+        command = parse_recording_command(full_text)
+        if not message_id or not message_id.startswith("om_") or not media_files:
+            raise ValueError("录屏消息缺少视频或消息 ID，请将文字和视频放在同一条消息中发送。")
+        existing = list_records(BASE_ANCHOR, TABLE_ANCHOR, strict=True)
+        record = select_recording_record(existing, command)
+        fields = record.get("fields", {})
+        links = recording_links(fields)
+        existing_slot = next((slot for slot, value in links if value == message_id), None)
+        slot = existing_slot or command["slot"]
+        if slot is None:
+            slot = next((index for index, value in links if not value), None)
+        if slot is None:
+            raise ValueError("该记录的 3 个录屏位置已满，未覆盖原录屏，请先在表格中核对。")
+        current_value = dict(links)[slot]
+        if current_value and current_value != message_id:
+            raise ValueError(f"录屏{slot}已存在，未覆盖。请使用空闲序号或先在表格中核对。")
+        if not existing_slot:
+            update_record(BASE_ANCHOR, TABLE_ANCHOR, record["record_id"], {f"录屏链接{slot}": message_id})
+        saved_label = f"{command['anchor_name']}（{recording_date(fields.get('数据日期'))}）录屏{slot}"
+        reply_message(message_id, f"✅ 已登记：{saved_label}\n原视频消息见上方引用。", strict=True)
+    except Exception as exc:
+        if saved_label:
+            send_group_msg(f"已登记 {saved_label}，但发送原视频引用失败：{exc}")
         else:
-            send_group_msg(f"录屏未找到 {anchor_name} 的主播记录，请先登记主播数据再发录屏")
-    except Exception as e:
-        send_group_msg(f"录屏处理失败({anchor_name}): {e}")
+            send_group_msg(f"录屏未登记：{exc}")
 
 
 def _handle_view_recording(message_id, full_text):
-    """处理"查看录屏"命令：从主播表查找该主播该日期的录屏 message_id → 回复引用该视频消息。
-    支持的命令格式：
-      @看数据 查看录屏 小琦              → 查看小琦最近的录屏
-      @看数据 查看录屏 小琦 11-05        → 查看小琦11月5日的录屏
-      @看数据 查看录屏 小琦 2026-11-05   → 查看小琦2026年11月5日的录屏
-      @看数据 查看小琦的录屏             → 查看小琦最近的录屏
-      @看数据 查看小琦 11.5的录屏        → 查看小琦11月5日的录屏
-    表格"录屏链接1/2/3"字段里存的是录屏消息的 message_id（om_xxx）。"""
-    import re
-    from datetime import datetime, timezone, timedelta
-    CST = timezone(timedelta(hours=8))
-
-    # 从文字提取主播名和日期
-    # 去掉"查看"、"录屏"、"的"等关键词和@用户名
-    text = full_text.replace("查看录屏", "").replace("查看", "").replace("录屏", "").replace("的", "")
-    text = re.sub(r"@\S+", "", text).strip()
-
-    # 提取日期（如果有）
-    target_date = None
-    # 完整日期 2026-11-05
-    m = re.search(r"(20\d{2})[.\-/](\d{1,2})[.\-/](\d{1,2})", text)
-    if m:
-        y, mo, d = m.groups()
-        target_date = f"{y}-{int(mo):02d}-{int(d):02d}"
-        text = text[:m.start()] + text[m.end():]
-    else:
-        # 月日 11-05 / 11.5
-        m = re.search(r"(?<!\d)(\d{1,2})[.\-/](\d{1,2})(?!\d)", text)
-        if m:
-            mo, d = m.groups()
-            y = datetime.now(CST).year
-            target_date = f"{y}-{int(mo):02d}-{int(d):02d}"
-            text = text[:m.start()] + text[m.end():]
-
-    anchor_name = text.strip()
-    if not anchor_name:
-        reply_message(message_id, "查看录屏：请在消息里写明主播名，格式如\"查看录屏 小琦\"或\"查看录屏 小琦 11-05\"")
-        return
-
-    base = BASE_ANCHOR
-    table = TABLE_ANCHOR
-
+    """按同一套命令规则查询；指定录屏序号时只返回该段，未指定时返回所有已存段。"""
     try:
-        existing = list_records(base, table)
-
-        # 按日期降序排序（最新在前）
-        def _date_val(rec):
-            d = rec.get("fields", {}).get("数据日期", "")
-            if isinstance(d, (int, float)) and d > 1000000000:
-                return d
-            return 0
-        existing_sorted = sorted(existing, key=_date_val, reverse=True)
-
-        target_rec = None
-
-        if target_date:
-            # 指定了日期：精确匹配该主播该日期
-            for rec in existing_sorted:
-                rec_fields = rec.get("fields", {})
-                rec_anchor = str(rec_fields.get("主播姓名", ""))
-                rec_date = rec_fields.get("数据日期", "")
-                if isinstance(rec_date, (int, float)) and rec_date > 1000000000:
-                    rec_date_str = datetime.fromtimestamp(rec_date / 1000, tz=CST).strftime("%Y-%m-%d")
-                else:
-                    rec_date_str = str(rec_date)[:10]
-                if anchor_name in rec_anchor and target_date == rec_date_str:
-                    target_rec = rec
-                    break
-        else:
-            # 未指定日期：找该主播最近一条有录屏的记录
-            for rec in existing_sorted:
-                rec_anchor = str(rec.get("fields", {}).get("主播姓名", ""))
-                if anchor_name in rec_anchor:
-                    # 检查是否有录屏 message_id
-                    has_recording = False
-                    for lf in ["录屏链接1", "录屏链接2", "录屏链接3"]:
-                        val = str(rec.get("fields", {}).get(lf, ""))
-                        if val and val.startswith("om_"):
-                            has_recording = True
-                            break
-                    if has_recording:
-                        target_rec = rec
-                        break
-                    # 没有录屏但匹配主播，先记住（作为备选）
-                    if not target_rec:
-                        target_rec = rec
-
-        if not target_rec:
-            reply_message(message_id, f"未找到主播 {anchor_name} 的记录，请确认主播名是否正确")
-            return
-
-        rec_fields = target_rec.get("fields", {})
-        rec_anchor = str(rec_fields.get("主播姓名", ""))
-        rec_date = rec_fields.get("数据日期", "")
-        if isinstance(rec_date, (int, float)) and rec_date > 1000000000:
-            rec_date_str = datetime.fromtimestamp(rec_date / 1000, tz=CST).strftime("%Y-%m-%d")
-        else:
-            rec_date_str = str(rec_date)[:10] if rec_date else "未知日期"
-
-        # 查找录屏 message_id（录屏链接1/2/3 里以 om_ 开头的值）
-        recording_msg_id = None
-        recording_idx = 0
-        for idx, lf in enumerate(["录屏链接1", "录屏链接2", "录屏链接3"], 1):
-            val = str(rec_fields.get(lf, ""))
-            if val and val.startswith("om_"):
-                recording_msg_id = val
-                recording_idx = idx
-                break
-
-        if not recording_msg_id:
-            reply_message(message_id, f"主播 {rec_anchor}（{rec_date_str}）没有登记录屏，请先发送录屏视频")
-            return
-
-        # 回复引用录屏消息（用户点击引用即可查看视频）
-        reply_message(
-            recording_msg_id,
-            f"📹 录屏回看：主播 {rec_anchor}（{rec_date_str}）的录屏\n"
-            f"（点击上方引用消息可查看/播放视频）"
-        )
-        # 同时回复当前命令消息，告知已调出录屏
-        reply_message(message_id, f"已调出主播 {rec_anchor}（{rec_date_str}）的录屏，请查看上方引用消息")
-
-    except Exception as e:
-        reply_message(message_id, f"查看录屏失败({anchor_name}): {e}")
+        command = parse_recording_command(full_text)
+        existing = list_records(BASE_ANCHOR, TABLE_ANCHOR, strict=True)
+        record = select_recording_record(existing, command, for_view=True)
+        fields = record.get("fields", {})
+        videos = [(slot, value) for slot, value in recording_links(fields)
+                  if value.startswith("om_") and (command["slot"] is None or slot == command["slot"])]
+        label = f"{command['anchor_name']}（{recording_date(fields.get('数据日期'))}）"
+        if not videos:
+            requested = f"录屏{command['slot']}" if command["slot"] else "录屏"
+            raise ValueError(f"{label}没有登记可引用的{requested}，请先收集视频。")
+        for slot, video_message_id in videos:
+            reply_message(video_message_id, f"📹 录屏回看：{label} 录屏{slot}\n原视频消息见上方引用。", strict=True)
+        reply_message(message_id, f"已发送 {label} 的 {len(videos)} 段录屏消息引用。", strict=True)
+    except Exception as exc:
+        reply_message(message_id, f"查看录屏未完成：{exc}")
 
 
 def send_group_msg(text):
@@ -463,18 +406,24 @@ def send_card_msg(title, content, button_text, button_url, template="green"):
         pass
 
 
-def reply_message(message_id, text):
-    """回复群消息（引用原消息），用于录屏收集后回复录屏消息。
-    回复消息会引用原消息（视频），用户在飞书客户端点击引用部分即可查看/播放视频。"""
+def reply_message(message_id, text, strict=False):
+    """回复原消息；录屏流程校验 API 结果，避免接口拒绝时仍宣称成功。"""
     try:
         token = get_tenant_token()
-        requests.post(
+        response = requests.post(
             f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reply",
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             json={"msg_type": "text", "content": json.dumps({"text": text})},
             timeout=15)
+        response.raise_for_status()
+        result = response.json()
+        if result.get("code") != 0:
+            raise RuntimeError(f"引用回复失败 code={result.get('code')}: {result.get('msg', '')}")
+        return result
     except Exception:
-        pass
+        if strict:
+            raise
+        return None
 
 
 ACCOUNTS = ["佳能Canon数码旗舰店", "Canon佳能摄影摄像旗舰店", "汉印拍立得旗舰店"]
@@ -517,23 +466,38 @@ def parse_text_meta(text):
     return None, account
 
 
-def list_records(base, table, page_size=100):
-    """拉取表格已有记录（用于去重判断）。
-    注意：飞书表格为空时 data.items 值是 null（key 存在但值为 null），
-    此时 .get("items", []) 返回的是 None 而非 []（默认值只在 key 不存在时生效），
-    必须显式处理 None，否则 is_duplicate 里 for rec in existing 会报 NoneType。"""
+def list_records(base, table, page_size=100, strict=False):
+    """读取所有页；录屏查询遇到权限或网络错误时不伪装成“没有记录”。"""
     try:
         token = get_tenant_token()
-        r = requests.get(
-            f"https://open.feishu.cn/open-apis/bitable/v1/apps/{base}/tables/{table}/records",
-            headers={"Authorization": f"Bearer {token}"},
-            params={"page_size": page_size}, timeout=15)
-        data = r.json()
-        if data.get("code") != 0:
-            return []
-        items = data.get("data", {}).get("items")
-        return items if isinstance(items, list) else []
+        records, seen_tokens = [], set()
+        page_token = None
+        while True:
+            params = {"page_size": page_size}
+            if page_token:
+                params["page_token"] = page_token
+            response = requests.get(
+                f"https://open.feishu.cn/open-apis/bitable/v1/apps/{base}/tables/{table}/records",
+                headers={"Authorization": f"Bearer {token}"},
+                params=params, timeout=15)
+            response.raise_for_status()
+            result = response.json()
+            if result.get("code") != 0:
+                raise RuntimeError(f"读取主播记录失败 code={result.get('code')}: {result.get('msg', '')}")
+            data = result.get("data") or {}
+            items = data.get("items")
+            if items is not None and not isinstance(items, list):
+                raise RuntimeError("表格返回的记录格式不正确。")
+            records.extend(items or [])
+            if not data.get("has_more"):
+                return records
+            page_token = data.get("page_token")
+            if not page_token or page_token in seen_tokens:
+                raise RuntimeError("表格分页信息异常，未取得完整记录。")
+            seen_tokens.add(page_token)
     except Exception:
+        if strict:
+            raise
         return []
 
 
@@ -648,7 +612,7 @@ def _handle_webhook(raw):
         return
     event = data.get("event", {})
     msg = event.get("message", {})
-    if msg.get("message_type") != "post":
+    if msg.get("message_type") not in ("post", "text"):
         return
     # message_id 去重（双重保险）：同一条消息飞书重试时 message_id 相同，跳过
     message_id_dedup = msg.get("message_id", "")
@@ -666,6 +630,9 @@ def _handle_webhook(raw):
         content = {}
     if not isinstance(content, dict):
         content = {}
+    if msg.get("message_type") == "text":
+        # 普通文本的“查看录屏”也需要处理，不能在 post 类型检查时丢弃。
+        content = {"content": [[{"tag": "text", "text": content.get("text", "")}]]}
     # 兼容飞书 post 消息多种 content 结构：
     #   {"zh_cn":{"content":[...]}}  （飞书事件推送的标准格式，有 locale 嵌套）
     #   {"title":"","content":[...]} （飞书消息 API 返回的扁平格式，无 locale）
@@ -1000,7 +967,7 @@ def index():
 def version():
     """版本和环境变量状态确认（排查部署问题用）"""
     return jsonify({
-        "version": "7.18",
+        "version": "7.19",
         "encrypt_key_set": bool(ENCRYPT_KEY),
         "app_id_set": bool(APP_ID),
         "app_secret_set": bool(APP_SECRET),
