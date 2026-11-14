@@ -38,24 +38,25 @@ PROMPT_LIVE = """识别这张抖音电商直播数据截图（可能是巨量千
 - 店铺名：截图右上角显示的店铺名称（如"佳能Canon数码旗舰店"，如果看不清或没有就填空字符串""）
 - 数据日期：YYYY-MM-DD格式，如果图里没有就填空字符串""
 - 账号：佳能Canon数码旗舰店/Canon佳能摄影摄像旗舰店/汉印拍立得旗舰店
-- 综合营销ROI：数字（如48.34）
-- 整体消耗：数字（去¥和逗号）
-- 直播时长（min）：分钟数
-- 直播间成交金额：数字（去¥和逗号）
-- 退款金额占比：小数（如0.6505表示65.05%）
-- 千次观看用户支付金额：数字（去¥和逗号）
-- 人均观看时长：秒整数
-- 平均在线人数：整数
-- 直播间曝光人数：整数（如"37.64万"转成376400）
-- 曝光-观看率：小数（如0.1567表示15.67%）
-- 直播间观看人数：整数（如"5.9万"转成59000）
+- 综合营销ROI：数字（如48.34），通常在巨量千川页面
+- 整体消耗：数字（去¥和逗号），通常在巨量千川页面
+- 直播时长（min）：分钟数，通常在罗盘直播大屏顶部显示（如"共16小时55分钟"→1015）
+- 直播间成交金额：数字（去¥和逗号），通常在罗盘直播大屏顶部
+- 退款金额占比：小数（如0.6505表示65.05%），通常在罗盘直播大屏
+- 千次观看用户支付金额：数字（去¥和逗号），通常在罗盘直播大屏
+- 人均观看时长：秒整数（如"1分钟7秒"→67），通常在罗盘直播大屏
+- 平均在线人数：整数，通常在罗盘直播大屏（如62）
+- 直播间曝光人数：整数（如"37.64万"转成376400），通常在罗盘转化漏斗
+- 曝光-观看率：小数（如0.1406表示14.06%），标签通常是"曝光-观看率"或"曝光-观看率（次数）"，在罗盘直播大屏或转化漏斗
+- 直播间观看人数：整数（如"5.9万"转成59000），通常在罗盘转化漏斗
 - 商品曝光-点击率：小数，指商品曝光后用户点击的比例（转化漏斗"商品曝光→商品点击"那层的转化率，约18%，注意不要和"观看→商品曝光"的转化率约76%混淆）
 - 商品点击-成交转化率：小数，指商品点击后成交的比例（转化漏斗"商品点击→成交"那层的转化率，约0.92%）
 
 重要规则：
 1. 只返这张图里显示的指标，没有显示的指标填空字符串""
 2. 数值不要带¥、逗号、万、%等符号，"万"要换算成纯数字（如5.9万=59000）
-3. 只返JSON，不要任何其他文字、不要markdown代码块"""
+3. 曝光-观看率返回小数形式（如14.06%返回0.1406），不要返回百分比数值
+4. 只返JSON，不要任何其他文字、不要markdown代码块"""
 PROMPT_ANCHOR = """识别这张抖音电商罗盘主播分析数据截图。这是主播对比表，可能显示基础数据或能力分析数据。
 返回严格JSON格式（不要markdown代码块），字段：
 - 类型：固定填"anchor"
@@ -303,14 +304,16 @@ def _handle_view_recording(message_id, full_text):
       @看数据 查看录屏 小琦              → 查看小琦最近的录屏
       @看数据 查看录屏 小琦 11-05        → 查看小琦11月5日的录屏
       @看数据 查看录屏 小琦 2026-11-05   → 查看小琦2026年11月5日的录屏
+      @看数据 查看小琦的录屏             → 查看小琦最近的录屏
+      @看数据 查看小琦 11.5的录屏        → 查看小琦11月5日的录屏
     表格"录屏链接1/2/3"字段里存的是录屏消息的 message_id（om_xxx）。"""
     import re
     from datetime import datetime, timezone, timedelta
     CST = timezone(timedelta(hours=8))
 
     # 从文字提取主播名和日期
-    # 去掉"查看录屏"关键词和@用户名
-    text = full_text.replace("查看录屏", "").replace("录屏", "")
+    # 去掉"查看"、"录屏"、"的"等关键词和@用户名
+    text = full_text.replace("查看录屏", "").replace("查看", "").replace("录屏", "").replace("的", "")
     text = re.sub(r"@\S+", "", text).strip()
 
     # 提取日期（如果有）
@@ -704,7 +707,8 @@ def _handle_webhook(raw):
             link_urls.append(fn)
 
     # 优先检查"查看录屏"命令（纯文字消息，优先级最高）
-    if "查看录屏" in full_text:
+    # 支持多种格式："查看录屏 小琦"、"查看小琦的录屏"、"查看小琦 11.5的录屏"
+    if "查看" in full_text and "录屏" in full_text:
         message_id = msg.get("message_id", "")
         _handle_view_recording(message_id, full_text)
         return  # 查看录屏命令处理完直接结束
@@ -771,6 +775,9 @@ def _handle_webhook(raw):
                     # 飞书百分比字段存储小数，值>1说明是百分比数值，需除以100
                     if k in PERCENT_FIELDS and val > 1:
                         val = val / 100
+                    # 值为0时跳过（可能是智谱没识别到该指标，留空待人工复查补）
+                    if val == 0:
+                        continue
                     f[k] = val
         f["数据状态"] = "草稿"
         f["AI识别结果"] = ai_raw
@@ -833,8 +840,11 @@ def _handle_webhook(raw):
                     for k, v in result.items():
                         rec[k] = v[i] if isinstance(v, list) and i < len(v) else v
                     anchor_name = str(rec.get("主播姓名", "")).strip()
-                    if not anchor_name:
+                    # 过滤异常主播名：空、列表格式(["",""])、不含中文的符号
+                    if not anchor_name or anchor_name.startswith("[") or anchor_name.startswith("{"):
                         continue
+                    if not re.search(r"[\u4e00-\u9fff]", anchor_name):
+                        continue  # 不含中文字符，可能是异常符号
                     if anchor_name not in merged_anchors:
                         merged_anchors[anchor_name] = {"_ai_raw": ai_raw}
                     # 合并字段（后识别的补充先识别的空值）
@@ -847,8 +857,11 @@ def _handle_webhook(raw):
                             merged_anchors[anchor_name][k] = v
             else:
                 anchor_name = str(result.get("主播姓名", "")).strip()
-                if not anchor_name:
+                # 过滤异常主播名：空、列表格式(["",""])、不含中文的符号
+                if not anchor_name or anchor_name.startswith("[") or anchor_name.startswith("{"):
                     continue
+                if not re.search(r"[\u4e00-\u9fff]", anchor_name):
+                    continue  # 不含中文字符，可能是异常符号
                 if anchor_name not in merged_anchors:
                     merged_anchors[anchor_name] = {"_ai_raw": ai_raw}
                 for k, v in result.items():
@@ -916,9 +929,17 @@ def _handle_webhook(raw):
             except Exception as e:
                 errors.append(f"第{idx+1}张图上传附件失败: {e}")
             # 合并字段（后识别的补充先识别的空值）
+            # 重要：只填充非空、非0的值。智谱对某张图没识别到某指标时可能返回空字符串或0，
+            # 这些空值/0值不应覆盖已有正确值，也不应填充到空字段（让其他图有机会填入正确值）
             for k, v in result.items():
+                v_str = str(v).strip() if v is not None else ""
+                # 跳过空值、纯0值（可能是智谱没识别到该指标）
+                if not v_str or v_str in ("0", "0.0", "0.00", "[]", '[""]', '["",""]'):
+                    continue
                 existing_val = merged.get(k)
-                if existing_val is None or str(existing_val).strip() == "":
+                existing_str = str(existing_val).strip() if existing_val is not None else ""
+                # 只在原值为空、不存在、或原值是0时才填充
+                if not existing_str or existing_str in ("0", "0.0", "0.00", "[]", '[""]', '["",""]'):
                     merged[k] = v
 
         # 核对店铺名：如果AI识别的店铺名和消息文字的账号不一致，提醒人工核实
@@ -979,7 +1000,7 @@ def index():
 def version():
     """版本和环境变量状态确认（排查部署问题用）"""
     return jsonify({
-        "version": "7.17",
+        "version": "7.18",
         "encrypt_key_set": bool(ENCRYPT_KEY),
         "app_id_set": bool(APP_ID),
         "app_secret_set": bool(APP_SECRET),
