@@ -1,4 +1,9 @@
 import os, json, base64, requests
+import tempfile
+import threading
+import time
+import re
+import zlib
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -165,37 +170,159 @@ def upload_attachment(image_bytes, filename, base_token):
     return data.get("data", {}).get("file_token", "")
 
 
-def download_media(message_id, file_key):
-    """下载群消息里的视频/文件资源。
-    用消息资源接口 type=file（download_image 用 type=image 只能下图片）。"""
-    token = get_tenant_token()
-    r = requests.get(
-        f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{file_key}",
-        headers={"Authorization": f"Bearer {token}"},
-        params={"type": "file"}, timeout=120)
-    if r.status_code != 200:
-        raise Exception(f"下载视频HTTP {r.status_code}: {r.text[:200]}")
-    return r.content
+RECORDING_CHUNK_BYTES = 4 * 1024 * 1024
+RECORDING_MAX_BYTES = 2 * 1024 * 1024 * 1024
+_RECORDING_LOCK = threading.Lock()
 
 
-def upload_video_to_drive(video_bytes, file_name):
-    """上传视频到飞书云空间根目录，返回 file_token 和可访问链接。"""
+def recording_api_result(response, action):
+    """仅检查录屏接口；HTTP或业务错误均不能当作成功。"""
+    try:
+        body = response.json()
+    except (ValueError, TypeError):
+        raise RuntimeError(f"{action}失败：HTTP {response.status_code}，接口未返回JSON。") from None
+    if not isinstance(body, dict):
+        raise RuntimeError(f"{action}失败：接口返回格式异常。")
+    if response.status_code != 200 or body.get("code") != 0:
+        raise RuntimeError(f"{action}失败：HTTP {response.status_code}，"
+                           f"code={body.get('code')}，{str(body.get('msg', ''))[:160]}")
+    return body.get("data") or {}
+
+
+def recording_request(method, url, **kwargs):
+    """录屏分片可重试网络错误/限流；权限错误立即返回上层。"""
+    for attempt in range(3):
+        try:
+            response = getattr(requests, method)(url, **kwargs)
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt == 2:
+                raise RuntimeError("录屏传输网络超时，请稍后用一条新消息重发。") from None
+        else:
+            if response.status_code not in (429, 500, 502, 503, 504) or attempt == 2:
+                return response
+            response.close()
+        time.sleep(2 ** attempt)
+
+
+def download_recording(message_id, file_key, destination, token):
+    """按Range下载到临时文件，验证长度，避免长录屏全部占用内存。"""
+    from urllib.parse import quote
+    url = ("https://open.feishu.cn/open-apis/im/v1/messages/"
+           f"{quote(message_id, safe='')}/resources/{quote(file_key, safe='')}")
+    offset, total = 0, None
+    while total is None or offset < total:
+        end = offset + RECORDING_CHUNK_BYTES - 1
+        if total is not None:
+            end = min(end, total - 1)
+        # 流读取中断时重下当前分片，先截断该分片的残留，禁止拼接损坏文件。
+        for attempt in range(3):
+            destination.seek(offset)
+            destination.truncate()
+            response = recording_request("get", url,
+                headers={"Authorization": f"Bearer {token}", "Range": f"bytes={offset}-{end}"},
+                params={"type": "file"}, stream=True, timeout=(15, 120))
+            try:
+                if response.status_code not in (200, 206):
+                    raise RuntimeError(f"下载录屏失败：HTTP {response.status_code}。"
+                                       "请核对机器人读取消息资源权限；过大视频可分段发送。")
+                mime = response.headers.get("Content-Type", "").lower()
+                if "json" in mime or "text/html" in mime:
+                    raise RuntimeError("下载录屏失败：接口返回错误信息而非文件。")
+                if response.status_code == 206:
+                    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", response.headers.get("Content-Range", ""))
+                    if not match:
+                        raise RuntimeError("录屏分片缺少有效Content-Range，未保存不完整文件。")
+                    start, last, received_total = map(int, match.groups())
+                    if (start != offset or last != min(end, received_total - 1)
+                            or received_total <= last or (total is not None and total != received_total)):
+                        raise RuntimeError("录屏分片范围不一致，未保存不完整文件。")
+                    expected = last - start + 1
+                    total = received_total
+                else:
+                    # 小文件接口可能忽略Range并返回整个文件，仅首段允许。
+                    if offset:
+                        raise RuntimeError("录屏接口未继续返回分片，未保存不完整文件。")
+                    length = response.headers.get("Content-Length")
+                    expected = int(length) if length is not None else None
+                    total = expected
+                if total is not None and (total <= 0 or total > RECORDING_MAX_BYTES):
+                    raise RuntimeError("录屏为空或超过2GB，请拆分后发送。")
+                count = 0
+                for chunk in response.iter_content(chunk_size=256 * 1024):
+                    if not chunk:
+                        continue
+                    count += len(chunk)
+                    if offset + count > RECORDING_MAX_BYTES or (expected is not None and count > expected):
+                        raise RuntimeError("录屏长度超过预期，未保存异常文件。")
+                    destination.write(chunk)
+                if not count or (expected is not None and count != expected):
+                    raise RuntimeError("录屏下载不完整，未写入附件，请用一条新消息重发。")
+                if total is None:
+                    total = count
+                offset += count
+                break
+            except (requests.Timeout, requests.ConnectionError, requests.exceptions.ChunkedEncodingError):
+                if attempt == 2:
+                    raise RuntimeError("录屏下载中断，未保存不完整文件，请用一条新消息重发。") from None
+                time.sleep(2 ** attempt)
+            finally:
+                response.close()
+    destination.seek(0)
+    return total
+
+
+def upload_recording(file_obj, file_name, size, token):
+    """上传到当前主播多维表格的素材空间；不上传到云盘根目录。"""
+    root = "https://open.feishu.cn/open-apis/drive/v1/medias"
+    headers = {"Authorization": f"Bearer {token}"}
+    response = recording_request("post", root + "/upload_prepare", headers=headers,
+        json={"file_name": file_name, "parent_type": "bitable_file", "parent_node": BASE_ANCHOR,
+              "size": size}, timeout=(15, 60))
+    prepared = recording_api_result(response, "准备录屏附件上传")
+    upload_id = prepared.get("upload_id")
+    block_size, block_num = prepared.get("block_size"), prepared.get("block_num")
+    if (not upload_id or not isinstance(block_size, int) or not 0 < block_size <= 20 * 1024 * 1024
+            or not isinstance(block_num, int) or block_num != (size + block_size - 1) // block_size):
+        raise RuntimeError("录屏上传分片策略异常，未写入附件。")
+    file_obj.seek(0)
+    for seq in range(block_num):
+        part = file_obj.read(min(block_size, size - seq * block_size))
+        if len(part) != min(block_size, size - seq * block_size):
+            raise RuntimeError("本地录屏分片不完整，未写入附件。")
+        response = recording_request("post", root + "/upload_part", headers=headers,
+            data={"upload_id": upload_id, "seq": str(seq), "size": str(len(part)),
+                  "checksum": str(zlib.adler32(part) & 0xffffffff)},
+            files={"file": (file_name, part, "application/octet-stream")}, timeout=(15, 120))
+        recording_api_result(response, f"上传录屏分片{seq + 1}/{block_num}")
+        # 官方素材上传接口限频5QPS，录屏线程串行并留出间隔。
+        time.sleep(0.25)
+    response = recording_request("post", root + "/upload_finish", headers=headers,
+        json={"upload_id": upload_id, "block_num": block_num}, timeout=(15, 120))
+    file_token = recording_api_result(response, "完成录屏附件上传").get("file_token")
+    if not isinstance(file_token, str) or not file_token:
+        raise RuntimeError("上传完成未返回附件token，未写入表格。")
+    return file_token
+
+
+def store_recording_attachment(message_id, media, filename):
+    file_key = str(media.get("file_key") or "").strip()
+    if not file_key:
+        raise ValueError("录屏消息缺少文件标识，请将文字和视频放在同一条消息中重新发送。")
     token = get_tenant_token()
-    size = len(video_bytes)
-    r = requests.post(
-        "https://open.feishu.cn/open-apis/drive/v1/files/upload_all",
-        headers={"Authorization": f"Bearer {token}"},
-        data={"file_name": file_name, "parent_type": "explorer",
-              "parent_node": "", "size": str(size)},
-        files={"file": (file_name, video_bytes)},
-        timeout=180)
-    data = r.json()
-    if data.get("code") != 0:
-        raise Exception(f"视频上传云空间失败 code={data.get('code')}: {data.get('msg','')}")
-    file_token = data.get("data", {}).get("file_token", "")
-    # 飞书云空间文件链接格式
-    share_url = f"https://fcndv9la878k.feishu.cn/file/{file_token}"
-    return file_token, share_url
+    with tempfile.TemporaryFile(mode="w+b") as video:
+        size = download_recording(message_id, file_key, video, token)
+        return {"file_token": upload_recording(video, filename, size, token), "size": size}
+
+
+def get_recording_record(record_id):
+    token = get_tenant_token()
+    response = recording_request("get",
+        f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BASE_ANCHOR}/tables/{TABLE_ANCHOR}/records/{record_id}",
+        headers={"Authorization": f"Bearer {token}"}, timeout=(15, 30))
+    record = recording_api_result(response, "核对录屏附件").get("record")
+    if not isinstance(record, dict) or record.get("record_id") != record_id:
+        raise RuntimeError("录屏记录读回异常，尚未确认附件保存成功。")
+    return record
 
 
 def update_record(base, table, record_id, fields):
@@ -282,6 +409,20 @@ def recording_links(fields):
     return [(slot, field_text(fields.get(f"录屏链接{slot}")).strip()) for slot in (1, 2, 3)]
 
 
+def recording_attachments(fields, slot):
+    value = fields.get(f"录屏附件{slot}")
+    if not value:
+        return []
+    if not isinstance(value, list) or any(not isinstance(item, dict) or not item.get("file_token") for item in value):
+        raise ValueError(f"录屏附件{slot}字段不是有效的附件列表，请先核对字段类型。")
+    return value
+
+
+def recording_record_url(record_id):
+    return (f"https://fcndv9la878k.feishu.cn/base/{BASE_ANCHOR}"
+            f"?table={TABLE_ANCHOR}&view=vewxtRhz5q&record={record_id}")
+
+
 def select_recording_record(existing, command, for_view=False):
     """姓名精确匹配；显式日期不回退；多账号或多条同日记录不猜测。"""
     candidates = []
@@ -303,7 +444,8 @@ def select_recording_record(existing, command, for_view=False):
     if not command["date"]:
         if for_view:
             with_video = [r for r in candidates if any(
-                value.startswith("om_") and (command["slot"] is None or slot == command["slot"])
+                (value.startswith("om_") or recording_attachments(r.get("fields", {}), slot))
+                and (command["slot"] is None or slot == command["slot"])
                 for slot, value in recording_links(r.get("fields", {})))]
             if with_video:
                 candidates = with_video
@@ -318,34 +460,69 @@ def select_recording_record(existing, command, for_view=False):
 
 
 def _handle_recording(message_id, full_text, media_files):
-    """保存原视频消息 ID；精确绑定日期/主播/账号，按序号登记且不覆盖已有录屏。"""
+    """串行保存录屏文件；只更新指定附件及其原消息标识，其他业务字段不变。"""
     saved_label = None
     try:
         command = parse_recording_command(full_text)
         if not message_id or not message_id.startswith("om_") or not media_files:
             raise ValueError("录屏消息缺少视频或消息 ID，请将文字和视频放在同一条消息中发送。")
-        existing = list_records(BASE_ANCHOR, TABLE_ANCHOR, strict=True)
-        record = select_recording_record(existing, command)
-        fields = record.get("fields", {})
-        links = recording_links(fields)
-        existing_slot = next((slot for slot, value in links if value == message_id), None)
-        slot = existing_slot or command["slot"]
-        if slot is None:
-            slot = next((index for index, value in links if not value), None)
-        if slot is None:
-            raise ValueError("该记录的 3 个录屏位置已满，未覆盖原录屏，请先在表格中核对。")
-        current_value = dict(links)[slot]
-        if current_value and current_value != message_id:
-            raise ValueError(f"录屏{slot}已存在，未覆盖。请使用空闲序号或先在表格中核对。")
-        if not existing_slot:
-            update_record(BASE_ANCHOR, TABLE_ANCHOR, record["record_id"], {f"录屏链接{slot}": message_id})
-        saved_label = f"{command['anchor_name']}（{recording_date(fields.get('数据日期'))}）录屏{slot}"
-        reply_message(message_id, f"✅ 已登记：{saved_label}\n原视频消息见上方引用。", strict=True)
+        if len(media_files) != 1:
+            raise ValueError("一条录屏登记消息请只附一段视频，分别使用录屏1、2、3登记。")
+        if not media_files[0].get("file_key"):
+            raise ValueError("录屏消息缺少文件标识，请将文字和视频放在同一条消息中重发。")
+        with _RECORDING_LOCK:
+            existing = list_records(BASE_ANCHOR, TABLE_ANCHOR, strict=True)
+            record = select_recording_record(existing, command)
+            fields = record.get("fields", {})
+            links = recording_links(fields)
+            existing_slot = next((slot for slot, value in links if value == message_id), None)
+            slot = existing_slot or command["slot"]
+            if slot is None:
+                slot = next((index for index, value in links
+                             if not value and not recording_attachments(fields, index)), None)
+            if slot is None:
+                raise ValueError("该记录的 3 个录屏位置已满，未覆盖原录屏，请先在表格中核对。")
+            current_value = dict(links)[slot]
+            attachments = recording_attachments(fields, slot)
+            if (current_value and current_value != message_id) or (attachments and existing_slot != slot):
+                raise ValueError(f"录屏{slot}已存在，未覆盖。请使用空闲序号或先在表格中核对。")
+            if not attachments:
+                ext = os.path.splitext(str(media_files[0].get("file_name") or ""))[1].lower()
+                if ext not in (".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"):
+                    ext = ".mp4"
+                filename = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_",
+                    f"{recording_date(fields.get('数据日期'))}_{command['anchor_name']}_录屏{slot}{ext}")
+                uploaded = store_recording_attachment(message_id, media_files[0], filename)
+                token = uploaded.get("file_token")
+                if not token:
+                    raise RuntimeError("未取得视频附件token，未写入表格。")
+                # 长视频传输期间用户可能编辑记录；写入前重新核对归属和槽位。
+                latest = get_recording_record(record["record_id"])
+                latest_fields = latest.get("fields", {})
+                for name in ("主播姓名", "所属账号", "数据日期"):
+                    normalize = recording_date if name == "数据日期" else lambda value: field_text(value).strip()
+                    if normalize(latest_fields.get(name)) != normalize(fields.get(name)):
+                        raise RuntimeError("上传期间主播记录的姓名、账号或日期发生变化，未写入附件。")
+                if (dict(recording_links(latest_fields))[slot] != current_value
+                        or recording_attachments(latest_fields, slot) != attachments):
+                    raise RuntimeError(f"上传期间录屏{slot}已被修改，未覆盖，请核对表格。")
+                patch_fields = {f"录屏附件{slot}": [{"file_token": token}], f"录屏链接{slot}": message_id}
+                update_record(BASE_ANCHOR, TABLE_ANCHOR, record["record_id"], patch_fields)
+                # 只有文件token与消息标识读回一致才发送成功提示。
+                checked = get_recording_record(record["record_id"]).get("fields", {})
+                actual = recording_attachments(checked, slot)
+                if ([item["file_token"] for item in actual] != [token]
+                        or dict(recording_links(checked))[slot] != message_id):
+                    raise RuntimeError("已提交附件写入，但读回未匹配，尚未确认保存成功；请核对表格。")
+            saved_label = f"{command['anchor_name']}（{recording_date(fields.get('数据日期'))}）录屏{slot}"
+        reply_message(message_id, f"✅ 已保存视频附件：{saved_label}\n"
+                      f"在每日主播明细的“录屏附件{slot}”中打开：\n"
+                      f"{recording_record_url(record['record_id'])}", strict=True)
     except Exception as exc:
         if saved_label:
-            send_group_msg(f"已登记 {saved_label}，但发送原视频引用失败：{exc}")
+            send_group_msg(f"已保存附件 {saved_label}，但发送确认回复失败：{exc}")
         else:
-            send_group_msg(f"录屏未登记：{exc}")
+            send_group_msg(f"录屏附件保存未完成：{exc}")
 
 
 def _handle_view_recording(message_id, full_text):
@@ -358,6 +535,16 @@ def _handle_view_recording(message_id, full_text):
         videos = [(slot, value) for slot, value in recording_links(fields)
                   if value.startswith("om_") and (command["slot"] is None or slot == command["slot"])]
         label = f"{command['anchor_name']}（{recording_date(fields.get('数据日期'))}）"
+        attachment_slots = [slot for slot in (1, 2, 3)
+                            if (command["slot"] is None or slot == command["slot"])
+                            and recording_attachments(fields, slot)]
+        if attachment_slots:
+            reply_message(message_id, f"📹 {label} 已保存的视频附件："
+                          + "、".join(f"录屏{x}" for x in attachment_slots)
+                          + f"\n{recording_record_url(record['record_id'])}", strict=True)
+            videos = [(slot, value) for slot, value in videos if slot not in attachment_slots]
+            if not videos:
+                return
         if not videos:
             requested = f"录屏{command['slot']}" if command["slot"] else "录屏"
             raise ValueError(f"{label}没有登记可引用的{requested}，请先收集视频。")
@@ -680,12 +867,10 @@ def _handle_webhook(raw):
         _handle_view_recording(message_id, full_text)
         return  # 查看录屏命令处理完直接结束
 
+    if media_files and "录屏" in full_text:
+        _handle_recording(msg.get("message_id", ""), full_text, media_files)
+        return
     if not image_keys:
-        # 无图片：可能是单独发送的录屏视频消息
-        # 如果消息含"录屏"关键词且有视频文件 → 走录屏收集流程
-        if media_files and "录屏" in full_text:
-            message_id = msg.get("message_id", "")
-            _handle_recording(message_id, full_text, media_files)
         return  # 无图，后台线程直接结束
 
     # 从消息文字提取日期和账号（问题4：格式"时间+账号+直播数据"，文字覆盖图片识别）
@@ -967,7 +1152,7 @@ def index():
 def version():
     """版本和环境变量状态确认（排查部署问题用）"""
     return jsonify({
-        "version": "7.19",
+        "version": "7.20",
         "encrypt_key_set": bool(ENCRYPT_KEY),
         "app_id_set": bool(APP_ID),
         "app_secret_set": bool(APP_SECRET),
