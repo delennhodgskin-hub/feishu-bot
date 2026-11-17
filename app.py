@@ -36,52 +36,9 @@ TABLE_LIVE = "tbl4Vmkv2B5zd2Cv"
 TABLE_ANCHOR = "tbljoPMRJvyzKupS"
 GROUP_CHAT = "oc_ecc73eac1ebd2fe694ef5b3d7687587f"
 
-PROMPT_LIVE = """识别这张抖音电商直播数据截图（可能是巨量千川直播页、抖音电商罗盘直播大屏、或直播转化漏斗页）。
-首先看截图右上角的店铺名称，在JSON里填"店铺名"字段。
-返回JSON，字段：
-- 类型：固定填"live"
-- 店铺名：截图右上角显示的店铺名称（如"佳能Canon数码旗舰店"，如果看不清或没有就填空字符串""）
-- 数据日期：YYYY-MM-DD格式，如果图里没有就填空字符串""
-- 账号：佳能Canon数码旗舰店/Canon佳能摄影摄像旗舰店/汉印拍立得旗舰店
-- 综合营销ROI：数字（如48.34），通常在巨量千川页面
-- 整体消耗：数字（去¥和逗号），通常在巨量千川页面
-- 直播时长（min）：分钟数，通常在罗盘直播大屏顶部显示（如"共16小时55分钟"→1015）
-- 直播间成交金额：数字（去¥和逗号），通常在罗盘直播大屏顶部
-- 退款金额占比：小数（如0.6505表示65.05%），通常在罗盘直播大屏
-- 千次观看用户支付金额：数字（去¥和逗号），通常在罗盘直播大屏
-- 人均观看时长：秒整数（如"1分钟7秒"→67），通常在罗盘直播大屏
-- 平均在线人数：整数，通常在罗盘直播大屏（如62）
-- 直播间曝光人数：整数（如"37.64万"转成376400），通常在罗盘转化漏斗
-- 曝光-观看率：小数（如0.1406表示14.06%），标签通常是"曝光-观看率"或"曝光-观看率（次数）"，在罗盘直播大屏或转化漏斗
-- 直播间观看人数：整数（如"5.9万"转成59000），通常在罗盘转化漏斗
-- 商品曝光-点击率：小数，指商品曝光后用户点击的比例（转化漏斗"商品曝光→商品点击"那层的转化率，约18%，注意不要和"观看→商品曝光"的转化率约76%混淆）
-- 商品点击-成交转化率：小数，指商品点击后成交的比例（转化漏斗"商品点击→成交"那层的转化率，约0.92%）
-
-重要规则：
-1. 只返这张图里显示的指标，没有显示的指标填空字符串""
-2. 数值不要带¥、逗号、万、%等符号，"万"要换算成纯数字（如5.9万=59000）
-3. 曝光-观看率返回小数形式（如14.06%返回0.1406），不要返回百分比数值
-4. 只返JSON，不要任何其他文字、不要markdown代码块"""
-PROMPT_ANCHOR = """识别这张抖音电商罗盘主播分析数据截图。这是主播对比表，可能显示基础数据或能力分析数据。
-返回严格JSON格式（不要markdown代码块），字段：
-- 类型：固定填"anchor"
-- 数据日期：YYYY-MM-DD格式，如果图里没有就填空字符串""
-- 主播姓名：数组，每个主播一个元素（如["张三","李四"]）
-- 所属账号：数组，每个主播对应的账号
-- 直播间用户支付金额：数组，数字（去逗号）
-- 单小时用户支付金额：数组，数字（去逗号）
-- 最高在线人数：数组，整数
-- 平均在线人数：数组，整数
-- 曝光-观看率：数组，小数（如0.1567表示15.67%）
-- 留存率：数组，小数
-- UV价值：数组，数字
-
-重要规则：
-1. 所有字段都返回数组（即使只有1个主播）
-2. 如果图里某个指标没有显示，对应位置填空字符串""
-3. 数值不要带¥、逗号、%等符号，只返纯数字
-4. 主播姓名要准确识别，不要编造
-5. 只返JSON，不要任何其他文字、不要markdown代码块"""
+from data_intake import PROMPT_LIVE, PROMPT_ANCHOR
+import data_intake as intake
+_SCREENSHOT_WRITE_LOCK = threading.Lock()
 
 
 def get_tenant_token():
@@ -782,6 +739,168 @@ def _process_in_background(raw):
             pass
 
 
+
+def ensure_summary_entries(base, kind, fields):
+    """Create only the current business month/profile; never invent HR metadata."""
+    from datetime import datetime
+    date = datetime.fromtimestamp(fields["数据日期"] / 1000, intake.CST)
+    month = date.strftime("%Y-%m")
+    if kind == "anchor":
+        profile_table, monthly_table = "tblHvBriYitkY3n7", "tblJqwosky9lCcwe"
+        identity = {"主播姓名": fields["主播姓名"], "所属账号": fields["所属账号"]}
+        profiles = list_records(base, profile_table, strict=True)
+        if not any(all(intake.equivalent(r["fields"].get(k), v) for k, v in identity.items())
+                   and intake.text(r["fields"].get("数据类型")) != "测试数据" for r in profiles):
+            write_record(base, profile_table, {**identity, "数据类型": "正式数据"})
+    else:
+        monthly_table = "tbllka7HqEQ3DGBZ"
+        identity = {"账号": fields["账号"]}
+    monthly = list_records(base, monthly_table, strict=True)
+    key = {**identity, "月份": month}
+    if not any(all(intake.equivalent(r["fields"].get(k), v) for k, v in key.items())
+               and intake.text(r["fields"].get("数据类型")) != "测试数据" for r in monthly):
+        write_record(base, monthly_table, {**key, "数据类型": "正式数据",
+                                         "月初日期": intake.timestamp(month + "-01")})
+
+
+def sync_shared_ad_scope(base, table, existing, owner):
+    fields = owner["fields"]
+    if not intake.text(fields.get("投放统计口径")).startswith("全天主记录"):
+        return
+    scope = "同日共用：全天ROI及消耗见" + intake.text(fields.get("开播时间")) + "场，不重复累计"
+    for other in existing:
+        f = other["fields"]
+        if (other["record_id"] != owner["record_id"]
+                and intake.equivalent(f.get("数据日期"), fields["数据日期"])
+                and intake.text(f.get("账号")) == fields["账号"]
+                and intake.text(f.get("数据性质")) != "测试数据"
+                and all(intake.missing(f.get(k)) for k in intake.ADS)
+                and intake.text(f.get("投放统计口径")) != scope):
+            update_record(base, table, other["record_id"], {"投放统计口径": scope})
+            f["投放统计口径"] = scope
+
+
+def _handle_screenshots(message_id, full_text, image_keys):
+    """7.21: one session per message; partial fills or explicit corrections in-place."""
+    date, account = parse_text_meta(full_text)
+    kind = "anchor" if "主播" in full_text else "live"
+    correction = "更正" in full_text or "纠错" in full_text
+    if not date or not account:
+        send_group_msg("请注明数据日期和账号，例如：2026-11-16 佳能数码 07:10 直播数据；主播用2026-11-15 佳能摄影 主播数据。")
+        return
+    intake.timestamp(date)  # Validate date before downloading/uploading.
+    session = intake.message_time(full_text) if kind == "live" else None
+    base, table = (BASE_ANCHOR, TABLE_ANCHOR) if kind == "anchor" else (BASE_LIVE, TABLE_LIVE)
+    prompt = PROMPT_ANCHOR if kind == "anchor" else PROMPT_LIVE
+    results, raw_results, attachments, issues = [], [], [], []
+    for i, image_key in enumerate(image_keys, 1):
+        try:
+            img = download_image(message_id, image_key)
+            raw = ai_recognize(img, prompt)
+            result = intake.parse_result(raw)
+            # Recognizable account contradictions block the batch. Truncated shop names
+            # remain a review warning, not evidence for overwriting a different account.
+            for key in ("店铺名", "账号", "所属账号"):
+                values = result.get(key)
+                values = values if isinstance(values, list) else [values]
+                for value in values:
+                    if intake.missing(value):
+                        continue
+                    _, recognized = parse_text_meta(intake.text(value))
+                    if recognized and recognized != account:
+                        raise ValueError("截图账号与文字账号不一致，整条消息未登记")
+            results.append(result)
+            raw_results.append({"image_index": i, "result": result})
+            try:
+                token = upload_attachment(img, f"截图{i}", base)
+                if token:
+                    attachments.append(token)
+            except Exception as e:
+                issues.append(f"第{i}张原图保存失败：{e}")
+        except ValueError as e:
+            send_group_msg(f"未登记：{e}。请核对截图后重新发送。")
+            return
+        except Exception as e:
+            issues.append(f"第{i}张识别失败：{e}")
+    candidates, merge_issues = intake.merge_results(results, kind, date, account, session)
+    issues.extend(merge_issues)
+    named = [r for r in candidates if kind == "anchor" and r["主播姓名"] in full_text]
+    if named:
+        candidates = named
+    created = updated = unchanged = 0
+    # Serialize read/plan/write to prevent concurrent screenshot events creating duplicates.
+    with _SCREENSHOT_WRITE_LOCK:
+        existing = list_records(base, table, strict=True)
+        plans = []
+        for fields in candidates:
+            try:
+                metrics = intake.ANCHOR if kind == "anchor" else intake.LIVE - {"开播时间"}
+                if not any(k in fields for k in metrics):
+                    continue
+                target = intake.select_target(fields, existing, kind, correction)
+                if kind == "live":
+                    fields = intake.route_daily_ads(fields, existing, target)
+                patch, conflict = intake.plan_patch(fields, target, correction)
+                issues.extend(conflict)
+                if not patch:
+                    unchanged += 1
+                    if target:
+                        try:
+                            ensure_summary_entries(base, kind, target["fields"])
+                            if kind == "live":
+                                sync_shared_ad_scope(base, table, existing, target)
+                        except Exception as e:
+                            issues.append(f"原明细未变，档案/月度同步失败：{e}")
+                    continue
+                old = target["fields"] if target else {}
+                patch["数据状态"] = "草稿"
+                if attachments:
+                    patch["截图附件"] = intake.append_attachments(old.get("截图附件"), attachments)
+                audit = {"version": "7.21", "message_id": message_id,
+                         "mode": "更正" if correction else "补充", "issues": issues,
+                         "changes": {k: {"before": old.get(k), "after": v}
+                                     for k, v in patch.items() if k not in {"截图附件", "数据状态"}},
+                         "sources": raw_results}
+                # Preserve the immediate previous provenance and bounded earlier history.
+                prior = intake.text(old.get("AI识别结果"))
+                patch["AI识别结果"] = json.dumps(audit, ensure_ascii=False) + ("\n---此前记录---\n" + prior[-20000:] if prior else "")
+                plans.append((target, patch))
+            except ValueError as e:
+                issues.append(str(e))
+        for target, patch in plans:
+            try:
+                saved = target
+                if target:
+                    update_record(base, table, target["record_id"], patch)
+                    target["fields"].update(patch)
+                    updated += 1
+                else:
+                    result = write_record(base, table, patch)
+                    new_record = (result.get("data") or {}).get("record")
+                    if new_record:
+                        existing.append(new_record)
+                        saved = new_record
+                    created += 1
+            except Exception as e:
+                issues.append(f"保存失败：{e}")
+                continue
+            try:
+                if saved:
+                    ensure_summary_entries(base, kind, saved["fields"])
+                    if kind == "live":
+                        sync_shared_ad_scope(base, table, existing, saved)
+            except Exception as e:
+                issues.append(f"明细已保存，但档案/月度或投放标记未同步：{e}；请稍后重发补图重试")
+    parts = [f"新增{created}条，更新原记录{updated}条，无数值变化{unchanged}条。"]
+    if created or updated:
+        parts.append("新增或更正的记录已设为草稿，请对照截图复查，再改为已复查；月汇总按已复查数据自动重算。")
+    if issues:
+        parts.append("需核对：\n" + "\n".join(dict.fromkeys(issues)))
+    if not candidates:
+        parts.append("没有取得可登记指标，请补清晰截图。")
+    send_group_msg("\n".join(parts))
+
+
 def _handle_webhook(raw):
     try:
         data = json.loads(raw) if raw else {}
@@ -873,274 +992,8 @@ def _handle_webhook(raw):
     if not image_keys:
         return  # 无图，后台线程直接结束
 
-    # 从消息文字提取日期和账号（问题4：格式"时间+账号+直播数据"，文字覆盖图片识别）
-    msg_date, msg_account = parse_text_meta(full_text)
-    is_anchor = "主播" in full_text
-    prompt = PROMPT_ANCHOR if is_anchor else PROMPT_LIVE
-    message_id = msg.get("message_id", "")
-    rtype_hint = "anchor" if is_anchor else "live"
-    base = BASE_ANCHOR if rtype_hint == "anchor" else BASE_LIVE
-    table = TABLE_ANCHOR if rtype_hint == "anchor" else TABLE_LIVE
+    _handle_screenshots(msg.get("message_id", ""), full_text, image_keys)
 
-    from datetime import datetime, timezone, timedelta
-    import re
-    CST = timezone(timedelta(hours=8))  # 表格时区 Asia/Shanghai
-
-    # 表格字段白名单：只处理这些字段名，智谱返回的其他字段名一律忽略（避免 FieldNameNotFound）
-    if rtype_hint == "anchor":
-        allowed = {"主播姓名", "所属账号", "数据日期", "直播间用户支付金额", "单小时用户支付金额",
-                   "最高在线人数", "平均在线人数", "曝光-观看率", "留存率", "UV价值"}
-    else:
-        allowed = {"数据日期", "账号", "综合营销ROI", "整体消耗", "直播时长（min）",
-                   "直播间成交金额", "退款金额占比", "千次观看用户支付金额", "人均观看时长",
-                   "平均在线人数", "直播间曝光人数", "曝光-观看率", "直播间观看人数",
-                   "商品曝光-点击率", "商品点击-成交转化率"}
-
-    # 百分比类型字段：飞书百分比字段存储小数(如0.1325表示13.25%)
-    # 智谱可能返回百分比数值(如13.25)，需除以100转成小数，否则飞书会显示1325%
-    PERCENT_FIELDS = {"退款金额占比", "曝光-观看率", "商品曝光-点击率", "商品点击-成交转化率", "留存率"}
-
-    def build_fields(rec, ai_raw):
-        """构造飞书 fields：数据日期转毫秒时间戳、文本转str、数字清洗。
-        空值或清洗不出数字的字段跳过（留空待人工复查补），避免 NumberFieldConvFail。
-        只处理白名单内字段名，避免智谱返回额外字段名导致 FieldNameNotFound。"""
-        f = {}
-        for k, v in rec.items():
-            if k not in allowed:
-                continue  # 非白名单字段一律跳过
-            if k == "数据日期":
-                try:
-                    f[k] = int(datetime.strptime(str(v)[:10], "%Y-%m-%d").replace(tzinfo=CST).timestamp() * 1000)
-                except Exception:
-                    pass  # 空或格式不对则跳过（datetime 字段留空）
-            elif k in ("账号", "主播姓名", "所属账号", "人均观看时长", "直播时长（min）"):
-                if str(v).strip():
-                    f[k] = str(v)
-            else:
-                s = str(v).strip().replace(",", "").replace("，", "")
-                s = re.sub(r"[¥元%人件秒个次]", "", s)
-                m = re.search(r"-?\d+\.?\d*", s)
-                if m:
-                    num = m.group()
-                    val = float(num) if "." in num else int(num)
-                    # 百分比字段：智谱可能返回百分比数值(如13.25)而非小数(0.1325)
-                    # 飞书百分比字段存储小数，值>1说明是百分比数值，需除以100
-                    if k in PERCENT_FIELDS and val > 1:
-                        val = val / 100
-                    # 值为0时跳过（可能是智谱没识别到该指标，留空待人工复查补）
-                    if val == 0:
-                        continue
-                    f[k] = val
-        f["数据状态"] = "草稿"
-        f["AI识别结果"] = ai_raw
-        return f
-
-    # 预拉取表格已有记录用于去重（问题2、3：每天每人/每账号只一组，重复发消息不重复登记）
-    existing = list_records(base, table)
-
-    # 统计变量初始化（必须在所有使用前定义，避免 UnboundLocalError/NameError）
-    total_ok = 0
-    skipped_dups = 0
-    errors = []
-    all_labels = []
-
-    # 主播消息特殊处理：多张图可能是同一批主播的不同维度数据（基础数据+能力分析）
-    # 需要按主播姓名合并到同一条记录，而非分开识别
-    if is_anchor:
-        # 收集所有图片的识别结果
-        all_anchor_results = []
-        anchor_attachment_tokens = []  # 主播截图附件file_token
-        for idx, img_key in enumerate(image_keys):
-            try:
-                img = download_image(message_id, img_key)
-                ai_result = ai_recognize(img, prompt)
-            except Exception as e:
-                errors.append(f"第{idx+1}张图识别失败: {e}")
-                continue
-            try:
-                clean = ai_result.strip()
-                if clean.startswith("```"):
-                    clean = clean.split("\n", 1)[1].rsplit("```", 1)[0]
-                result = json.loads(clean)
-            except Exception:
-                errors.append(f"第{idx+1}张图JSON解析失败: {ai_result[:120]}")
-                continue
-            # 上传主播截图到飞书表格附件
-            try:
-                ft = upload_attachment(img, f"主播截图{idx+1}", base)
-                if ft:
-                    anchor_attachment_tokens.append(ft)
-            except Exception as e:
-                errors.append(f"第{idx+1}张图上传附件失败: {e}")
-            # 用消息文字的日期/账号覆盖
-            if msg_date:
-                result["数据日期"] = msg_date
-            if msg_account:
-                result["所属账号"] = msg_account
-            result.pop("类型", None)
-            all_anchor_results.append((idx, ai_result, result))
-
-        # 按主播姓名合并多张图的数据
-        merged_anchors = {}  # 主播姓名 -> 合并后的记录
-        for idx, ai_raw, result in all_anchor_results:
-            # 拆分多主播
-            list_keys = [k for k, v in result.items() if isinstance(v, list)]
-            if list_keys:
-                n = max(len(result[k]) for k in list_keys)
-                for i in range(n):
-                    rec = {}
-                    for k, v in result.items():
-                        rec[k] = v[i] if isinstance(v, list) and i < len(v) else v
-                    anchor_name = str(rec.get("主播姓名", "")).strip()
-                    # 过滤异常主播名：空、列表格式(["",""])、不含中文的符号
-                    if not anchor_name or anchor_name.startswith("[") or anchor_name.startswith("{"):
-                        continue
-                    if not re.search(r"[\u4e00-\u9fff]", anchor_name):
-                        continue  # 不含中文字符，可能是异常符号
-                    if anchor_name not in merged_anchors:
-                        merged_anchors[anchor_name] = {"_ai_raw": ai_raw}
-                    # 合并字段（后识别的补充先识别的空值）
-                    for k, v in rec.items():
-                        if k == "主播姓名":
-                            continue
-                        existing_val = merged_anchors[anchor_name].get(k)
-                        # 只在原值为空或不存在时填充
-                        if existing_val is None or str(existing_val).strip() == "":
-                            merged_anchors[anchor_name][k] = v
-            else:
-                anchor_name = str(result.get("主播姓名", "")).strip()
-                # 过滤异常主播名：空、列表格式(["",""])、不含中文的符号
-                if not anchor_name or anchor_name.startswith("[") or anchor_name.startswith("{"):
-                    continue
-                if not re.search(r"[\u4e00-\u9fff]", anchor_name):
-                    continue  # 不含中文字符，可能是异常符号
-                if anchor_name not in merged_anchors:
-                    merged_anchors[anchor_name] = {"_ai_raw": ai_raw}
-                for k, v in result.items():
-                    if k == "主播姓名":
-                        continue
-                    existing_val = merged_anchors[anchor_name].get(k)
-                    if existing_val is None or str(existing_val).strip() == "":
-                        merged_anchors[anchor_name][k] = v
-
-        # 写入合并后的主播记录
-        for anchor_name, rec in merged_anchors.items():
-            ai_raw = rec.pop("_ai_raw", "")
-            rec["主播姓名"] = anchor_name
-            fields = build_fields(rec, ai_raw)
-            # 主播截图附件（所有主播记录都放同一组截图）
-            if anchor_attachment_tokens:
-                fields["截图附件"] = [{"file_token": t} for t in anchor_attachment_tokens]
-            # 录屏链接（从消息里提取的URL/文件名，分别放入录屏链接1/2/3）
-            for i, url in enumerate(link_urls[:3]):
-                fields[f"录屏链接{i+1}"] = url
-            if len(fields) <= 2:
-                continue
-            if is_duplicate(fields, existing, "anchor"):
-                skipped_dups += 1
-                continue
-            try:
-                write_record(base, table, fields)
-                total_ok += 1
-                all_labels.append(anchor_name)
-            except Exception as e:
-                errors.append(f"写入失败({anchor_name}): {e}")
-    else:
-        # 直播消息：多张图是同一场直播的不同页面数据（千川页/直播大屏/转化漏斗），
-        # 合并成一条记录，而非每张图独立一条
-        merged = {}  # 合并后的记录
-        ai_raws = []  # 所有图的AI原始返回
-        shop_names = []  # 各张图识别到店铺名
-        attachment_tokens = []  # 各张图上传附件后的file_token
-        for idx, img_key in enumerate(image_keys):
-            try:
-                img = download_image(message_id, img_key)
-                ai_result = ai_recognize(img, prompt)
-            except Exception as e:
-                errors.append(f"第{idx+1}张图识别失败: {e}")
-                continue
-            try:
-                clean = ai_result.strip()
-                if clean.startswith("```"):
-                    clean = clean.split("\n", 1)[1].rsplit("```", 1)[0]
-                result = json.loads(clean)
-            except Exception:
-                errors.append(f"第{idx+1}张图JSON解析失败: {ai_result[:120]}")
-                continue
-            # 收集店铺名用于核对
-            sn = str(result.get("店铺名", "")).strip()
-            if sn:
-                shop_names.append(sn)
-            result.pop("店铺名", None)
-            ai_raws.append(ai_result)
-            # 上传图片到飞书表格附件（收集每天3张直播截图）
-            try:
-                ft = upload_attachment(img, f"直播截图{idx+1}", base)
-                if ft:
-                    attachment_tokens.append(ft)
-            except Exception as e:
-                errors.append(f"第{idx+1}张图上传附件失败: {e}")
-            # 合并字段（后识别的补充先识别的空值）
-            # 重要：只填充非空、非0的值。智谱对某张图没识别到某指标时可能返回空字符串或0，
-            # 这些空值/0值不应覆盖已有正确值，也不应填充到空字段（让其他图有机会填入正确值）
-            for k, v in result.items():
-                v_str = str(v).strip() if v is not None else ""
-                # 跳过空值、纯0值（可能是智谱没识别到该指标）
-                if not v_str or v_str in ("0", "0.0", "0.00", "[]", '[""]', '["",""]'):
-                    continue
-                existing_val = merged.get(k)
-                existing_str = str(existing_val).strip() if existing_val is not None else ""
-                # 只在原值为空、不存在、或原值是0时才填充
-                if not existing_str or existing_str in ("0", "0.0", "0.00", "[]", '[""]', '["",""]'):
-                    merged[k] = v
-
-        # 核对店铺名：如果AI识别的店铺名和消息文字的账号不一致，提醒人工核实
-        for sn in shop_names:
-            if msg_account and sn and msg_account not in sn and sn not in msg_account:
-                errors.append(f"店铺名核对警告：截图右上角'{sn}'与消息账号'{msg_account}'不一致，请人工核实")
-                break
-
-        # 用消息文字的日期/账号覆盖AI识别结果
-        if msg_date:
-            merged["数据日期"] = msg_date
-        if msg_account:
-            merged["账号"] = msg_account
-        merged.pop("类型", None)
-
-        # 写入合并后的直播记录
-        ai_raw_combined = "\n---\n".join(ai_raws) if ai_raws else ""
-        fields = build_fields(merged, ai_raw_combined)
-        # 把每天3张直播截图作为附件写入"截图附件"字段
-        if attachment_tokens:
-            fields["截图附件"] = [{"file_token": t} for t in attachment_tokens]
-        if len(fields) <= 2:
-            if not errors:
-                errors.append("识别完成但无有效业务数据（截图可能无对应指标）")
-        else:
-            if is_duplicate(fields, existing, "live"):
-                skipped_dups += 1
-            else:
-                try:
-                    write_record(base, table, fields)
-                    total_ok += 1
-                    all_labels.append(merged.get("账号") or "未命名")
-                except Exception as e:
-                    errors.append(f"写入失败: {e}")
-
-    # 汇总群回复
-    parts = []
-    if total_ok:
-        parts.append(f"已识别并登记 {total_ok} 条草稿：{', '.join(all_labels)}")
-    if skipped_dups:
-        parts.append(f"跳过 {skipped_dups} 条重复记录")
-    if errors:
-        parts.append("问题：\n" + "\n".join(errors))
-    if total_ok:
-        parts.append("请复查后改数据状态为已复查。")
-    if not parts:
-        parts.append("识别完成但无有效数据写入（可能已重复登件或截图无有效数据）。")
-    send_group_msg("\n".join(parts))
-    return  # 后台线程结束（已返回200给飞书）
 
 
 @app.route("/", methods=["GET"])
@@ -1152,7 +1005,7 @@ def index():
 def version():
     """版本和环境变量状态确认（排查部署问题用）"""
     return jsonify({
-        "version": "7.20",
+        "version": "7.21",
         "encrypt_key_set": bool(ENCRYPT_KEY),
         "app_id_set": bool(APP_ID),
         "app_secret_set": bool(APP_SECRET),
