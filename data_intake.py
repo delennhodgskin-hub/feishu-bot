@@ -13,14 +13,15 @@ DASH = {'开播时间', '直播时长（min）', '直播间成交金额', '退�
         '千次观看用户支付金额', '人均观看时长', '平均在线人数'}
 ADS = {'综合营销ROI', '整体消耗'}
 LIVE = FUNNEL | DASH | ADS
+PAGE_METRICS = {'千川': ADS, '罗盘大屏': DASH - {'开播时间'}, '成交漏斗': FUNNEL}
 IDENTITY = {'数据日期', '账号', '所属账号', '主播姓名', '开播时间'}
 BLANK = {'', '--', '—', '-', 'null', 'none', '未显示', '未识别', '待补数值', '[]'}
 
 PROMPT_LIVE = '''逐字读取本张直播截图，只返回JSON。不要计算、补猜或借用示例数字。
 先返回：页面类型（千川/罗盘大屏/成交漏斗/未知）、店铺名、数据日期（YYYY-MM-DD，未显示填null）。
 千川页另返回统计口径（全天/单场/未知）；只有日期范围为同一天且没有场次筛选才是全天。
-每个指标返回截图上的原始字符串，保留小数点、逗号、万、%和时长单位；未显示、模糊、--返回null。明确0、0.00、0%必须保留。
-【千川】只读综合营销ROI、整体消耗两张同名卡片的主数值。不读其下方红绿环比涨跌；不能把整体成交金额、净成交金额、用户实际支付净成交金额当作直播间成交金额或整体消耗。ROI卡片为--时返回null，不能借旁边的百分比。
+每个指标返回截图上的原始字符串，保留小数点、逗号、万、%和时长单位；未显示或模糊时填null。明确显示横杠时抄"--"，明确0、0.00、0%必须保留。
+【千川】只读综合营销ROI、整体消耗两张同名卡片的主数值。不读其下方红绿环比涨跌；不能把整体成交金额、净成交金额、用户实际支付净成交金额当作直播间成交金额或整体消耗。ROI卡片为--时抄"--"，不能借旁边的百分比。
 【罗盘大屏】读顶部开播时间（HH:MM，不读当前电脑时间）、直播时长（min）（原文如X小时Y分钟，不自己换算）、直播间成交金额、退款金额占比、千次观看用户支付金额、人均观看时长（原文）、平均在线人数。
 大屏的曝光-观看率（次数）不得写入本项目的曝光-观看率（人数）。大屏不得返回成交漏斗的五个字段。
 【成交漏斗】只从左侧成交转化漏斗读：直播间曝光人数、直播间观看人数、曝光-观看率（人数）、商品曝光-点击率（人数）、商品点击-成交转化率（人数）。JSON键仍用曝光-观看率、商品曝光-点击率、商品点击-成交转化率。
@@ -29,7 +30,33 @@ PROMPT_LIVE = '''逐字读取本张直播截图，只返回JSON。不要计算�
 返回一个JSON对象（不是数组或字符串），固定包含“页面特征原文”（图上能看到的标题文字）和“开播时间原文”（复制顶部开播信息的完整原文；没有则null）。
 页面区分：巨量千川/千川乘方是千川；深色背景且顶部标题直播大屏的是罗盘大屏；有成交转化漏斗/互动转化漏斗的白色页面是成交漏斗。页面类型不能只因为有直播数据就都填罗盘大屏。
 开播时间只能取“开播时间 ... 开播”附近的时刻；必须同步抄录这段开播时间原文。千川页面更新时间、日期选择器、评论时间、视频时长、数据过期提示、折线图横轴刻度都不是开播时间。漏斗图没有顶部开播信息时，开播时间及原文必须为null。
-千川数据日期取右上日期选择器，不取“XX月XX日XX:XX更新”；原文日期范围可另填“统计日期原文”。不要把当天千川ROI和消耗当作另一个直播场次。'''
+千川数据日期取右上日期选择器，不取“XX月XX日XX:XX更新”；原文日期范围可另填“统计日期原文”。不要把当天千川ROI和消耗当作另一个直播场次。
+输出必须在同一个对象中列出该页的全部指标键和对应原文。即使已抄到开播时间原文和页面标题，仍须继续读取数值。
+明确显示的横杠按原文返回"--"，图中未发现的值返回null。'''
+
+LIVE_READ_GUIDE = {
+    '千川': '读取“千川乘方”直播面板的“综合营销ROI”和“整体消耗”两张卡片。抄卡片主值；紧邻红绿百分比是涨跌幅。',
+    '罗盘大屏': '读取顶部直播信息和蓝色指标区。成交金额选“直播间成交金额”；排除“含异常交易”和“用户支付金额”。时长抄顶部“共…小时…分钟”，人均观看时长从同名卡片抄。',
+    '成交漏斗': '读取白色页面左侧蓝色倒梯形“成交转化漏斗”。从漏斗读直播间曝光和观看人数；紧邻右侧读曝光→观看、商品曝光→点击、商品点击→成交三个人数比例。跳过观看→商品曝光和右方互动漏斗。',
+}
+
+def live_read_prompt(page):
+    """A flat, page-specific contract for the second look, with no sample values."""
+    pages = [page] if page in PAGE_METRICS else PAGE_METRICS
+    lines = ['重新逐字读取本张原图。根据顶部标题、图表形状和指标标签确认页面类型；单独输出该类型的完整JSON对象。',
+             '如果与先前判断不同，以图中证据为准。每一项抄主数值和原单位；百分比保留%，时长保留单位。'
+             '明确0取0；明确横杠返回"--"；看不清或没显示填null。']
+    for category in pages:
+        keys = ['页面类型', '页面特征原文', '店铺名', '数据日期']
+        if category == '千川':
+            keys += ['统计日期原文', '统计口径']
+        if category == '罗盘大屏':
+            keys += ['开播时间原文']
+        schema = dict.fromkeys(keys + sorted(PAGE_METRICS[category]), None)
+        schema['页面类型'] = category
+        lines.extend([LIVE_READ_GUIDE[category], '填写此结构中的全部可见数值：' + json.dumps(schema, ensure_ascii=False)])
+    lines.append('千川统计日期取日期选择器，同日且无场次筛选填“全天”。开播时间原文只抄大屏顶部实际开播信息。')
+    return '\n'.join(lines)
 
 PROMPT_ANCHOR = '''逐字读取抖音罗盘主播对比表，只返回JSON，不计算或猜测。
 页面类型固定为主播分析。数据日期、店铺名可为字符串；未显示填null。
@@ -247,7 +274,10 @@ def header_identity(result):
     shown_date = f'{y}-{int(month):02d}-{int(day):02d}' if y else None
     if shown_date:
         timestamp(shown_date)
-    return {'time': when, 'date': shown_date, 'caption': caption}
+    elapsed = re.match(r'\s*(?:开播)?\s*[,，、]?\s*共\s*((?:\d+小时(?:\d+(?:分钟|分))?|\d+分钟)(?:\d+秒)?)(?![\d.分秒])',
+                       caption[match.end():])
+    return {'time': when, 'date': shown_date, 'caption': caption,
+            'duration': elapsed[1] if elapsed else None}
 
 
 def page_kind(result):
@@ -273,15 +303,107 @@ def recognition_retry_reason(result, kind):
             return '未确认是主播对比表，请重读页面标题及顶部主播姓名列'
         return None
     page = page_kind(result)
-    if page not in {'千川', '罗盘大屏', '成交漏斗'}:
+    if page not in PAGE_METRICS:
         return '页面来源未识别，请逐字抄录页面标题并重新区分千川、大屏、成交漏斗'
+    missing_keys = live_metric_gaps(result, retry=True)
+    reasons = []
     if page == '罗盘大屏' and not header_identity(result):
-        return '缺少有效开播时间原文，请重看顶部开播信息；图表横轴和页面更新时间不能当开播时间'
-    return None
+        reasons.append('缺少有效开播时间原文，请重看顶部开播信息')
+    if page == '千川' and missing(result.get('统计口径')):
+        reasons.append('请从日期选择器和场次筛选读取统计口径')
+    if missing_keys:
+        reasons.append('请重读该页指标：' + '、'.join(missing_keys))
+    return '；'.join(reasons) or None
+
+
+def canonical_live_read(result):
+    source = dict(result)
+    if page_kind(source) == '罗盘大屏':
+        key = '直播时长（min）'
+        if missing(source.get(key)):
+            for alias in ('直播时长(min)', '直播时长（分钟）', '直播时长'):
+                if not missing(source.get(alias)):
+                    source[key] = source[alias]
+                    break
+        header = header_identity(source)
+        if header and header['duration'] and missing(source.get(key)):
+            source[key] = header['duration']
+    return source
+
+
+def live_metric_gaps(result, retry=False):
+    source = canonical_live_read(result)
+    gaps = []
+    for key in sorted(PAGE_METRICS.get(page_kind(source), ())):
+        raw = source.get(key)
+        if retry and isinstance(raw, str) and raw.strip() in {'--', '—', '-'}:
+            continue  # the model explicitly transcribed an unavailable mark
+        try:
+            if normalize(key, raw) is not None:
+                continue
+        except ValueError:
+            pass
+        gaps.append(key)
+    return gaps
+
+
+def reconcile_live_reads(first, second):
+    """Combine evidence from two reads of one image. Refuse contradictory evidence."""
+    first, second = canonical_live_read(first), canonical_live_read(second)
+    page, next_page = page_kind(first), page_kind(second)
+    header1 = header_identity(first) if page == '罗盘大屏' else None
+    header2 = header_identity(second) if next_page == '罗盘大屏' else None
+    if header1 and header2 and header1['time'] != header2['time']:
+        raise ValueError('两次读取的开播时间不同，请补大屏顶部原图')
+    day1 = (header1 or {}).get('date') or first.get('数据日期')
+    day2 = (header2 or {}).get('date') or second.get('数据日期')
+    if day1 and day2 and not equivalent(day1, day2):
+        raise ValueError('同张图两次读取的业务日期不一致，请核对原图')
+    if page not in PAGE_METRICS:
+        return second
+    if next_page not in PAGE_METRICS:
+        # A targeted re-read can reply with only the missing field(s) on the
+        # same image. Require named metrics from the established source.
+        read_keys = set(second).intersection(LIVE)
+        if (not read_keys or not read_keys.issubset(PAGE_METRICS[page])
+                or text(second.get('页面类型')) or text(second.get('页面特征原文'))):
+            return first
+        next_page = page
+    if page != next_page:
+        raise ValueError(f'同张图两次识别为{page}和{next_page}，请补该页清晰原图')
+    if page == '千川' and {text(first.get('统计口径')), text(second.get('统计口径'))} == {'全天', '单场'}:
+        raise ValueError('千川截图两次读取的统计口径不一致，请核对筛选范围')
+    # Prefer the more complete metadata, but never discard an established start header.
+    merged = {**first, **{k: v for k, v in second.items() if not missing(v)}}
+    merged['页面类型'] = page
+    if header1 and (not header2 or (header1['date'] and not header2['date'])):
+        merged['开播时间原文'] = first['开播时间原文']
+    if page == '千川' and first.get('统计口径') in ('全天', '单场') and second.get('统计口径') not in ('全天', '单场'):
+        merged['统计口径'] = first['统计口径']
+    for key in PAGE_METRICS[page]:
+        values = []
+        unavailable = False
+        for source in (first, second):
+            raw = source.get(key)
+            if isinstance(raw, str) and raw.strip() in ('--', '—', '-'):
+                unavailable = True
+            try:
+                val = normalize(key, raw)
+            except ValueError:
+                continue
+            if val is not None:
+                values.append((raw, val))
+        if values and (unavailable or not equivalent(values[0][1], values[-1][1])):
+            raise ValueError(f'{key}在同张图的两次识别中不一致，请补清晰原图')
+        if values:
+            merged[key] = values[0][0]
+        elif unavailable:
+            merged[key] = '--'
+    return merged
 
 
 def resolve_live_source(result, index):
-    source, issues = dict(result), []
+    source, issues = canonical_live_read(result), []
     page = page_kind(result)
     source['页面类型'] = page
     claimed = source.pop('开播时间', None)
@@ -376,6 +498,8 @@ def merge_results(results, kind, date, account, session=None):
                     rec['_ad_scope'] = '全天'
     if kind == 'live' and records:
         rec = records['live']
+        if not ADS.intersection(rec):
+            rec.pop('_ad_scope', None)
         if ('live', '开播时间') in conflicts:
             evidence = '；'.join('第' + '/'.join(map(str, indexes)) + '张顶部开播' + when
                                 for when, indexes in session_evidence.items())

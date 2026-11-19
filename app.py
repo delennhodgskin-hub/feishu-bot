@@ -38,6 +38,7 @@ GROUP_CHAT = "oc_ecc73eac1ebd2fe694ef5b3d7687587f"
 
 from data_intake import PROMPT_LIVE, PROMPT_ANCHOR
 import data_intake as intake
+import anchor_verify
 _SCREENSHOT_WRITE_LOCK = threading.Lock()
 
 
@@ -781,18 +782,26 @@ def sync_shared_ad_scope(base, table, existing, owner):
 
 
 def recognize_screenshot(image_bytes, prompt, kind, image_index):
-    """Normalize model output and retry malformed/source-ambiguous output once."""
+    """Read an image, then retry just once for format, source or missing live metrics."""
     attempts = []
-    retry_hint = ''
+    previous = None
+    current_prompt = prompt
     for attempt in range(2):
-        raw = ai_recognize(image_bytes, prompt + ('\n重新核对要求：' + retry_hint if retry_hint else ''))
+        try:
+            raw = ai_recognize(image_bytes, current_prompt)
+        except Exception:
+            if previous is None:
+                raise
+            attempts.append({"attempt": attempt + 1, "error": "补读请求未完成"})
+            return previous, attempts
         try:
             result = intake.parse_result(raw, kind=kind)
+            if kind == 'live':
+                result = intake.canonical_live_read(result)
             retry_hint = intake.recognition_retry_reason(result, kind) or ''
             attempts.append({"attempt": attempt + 1, "result": result, "retry_reason": retry_hint})
         except ValueError as e:
-            retry_hint = str(e) + '。请直接返回完整JSON；主播可以是一个含列数组的对象或每位主播一个对象的数组。'
-            # Log a bounded shape diagnostic, never credentials or image payloads.
+            retry_hint = str(e) + '。请直接返回完整JSON。'
             shape = type(raw).__name__
             if isinstance(raw, str):
                 shape += ':' + raw.lstrip().lstrip('`json\n\r\t ')[:1]
@@ -800,15 +809,29 @@ def recognize_screenshot(image_bytes, prompt, kind, image_index):
                                image_index, attempt + 1, shape, str(e))
             attempts.append({"attempt": attempt + 1, "shape": shape, "error": str(e)})
             if attempt == 1:
+                if previous is not None:
+                    return previous, attempts
                 raise ValueError(f'第{image_index}张识别格式仍未通过，请单独重发这张清晰原图') from None
+            current_prompt = prompt + '\n' + retry_hint
             continue
+        if previous is not None and kind == 'live':
+            try:
+                result = intake.reconcile_live_reads(previous, result)
+            except ValueError as e:
+                raise ValueError(f'第{image_index}张：{e}') from e
         if not retry_hint or attempt == 1:
+            if kind == 'anchor':
+                result, check = anchor_verify.verify_anchor_columns(result, image_bytes, ai_recognize)
+                attempts.append(check)
             return result, attempts
+        previous = result if kind == 'live' else None
+        current_prompt = (intake.live_read_prompt(intake.page_kind(result))
+                          if kind == 'live' else prompt) + '\n' + retry_hint
         app.logger.info('screenshot source retry: image=%s reason=%s', image_index, retry_hint)
 
 
 def _handle_screenshots(message_id, full_text, image_keys):
-    """7.22: accept one anchor comparison or two/three pages for a live session."""
+    """Accept one anchor comparison or two/three pages for a live session."""
     date, account = parse_text_meta(full_text)
     kind = "anchor" if "主播" in full_text else "live"
     correction = "更正" in full_text or "纠错" in full_text
@@ -830,15 +853,21 @@ def _handle_screenshots(message_id, full_text, image_keys):
             result, attempts = recognize_screenshot(img, prompt, kind, i)
             # Recognizable account contradictions block the batch. Truncated shop names
             # remain a review warning, not evidence for overwriting a different account.
-            for key in ("店铺名", "账号", "所属账号"):
-                values = result.get(key)
-                values = values if isinstance(values, list) else [values]
-                for value in values:
-                    if intake.missing(value):
-                        continue
-                    _, recognized = parse_text_meta(intake.text(value))
-                    if recognized and recognized != account:
-                        raise ValueError("截图账号与文字账号不一致，整条消息未登记")
+            reads = [a['result'] for a in attempts if isinstance(a.get('result'), dict)] or [result]
+            for read in reads:
+                for key in ("店铺名", "账号", "所属账号"):
+                    values = read.get(key)
+                    for value in values if isinstance(values, list) else [values]:
+                        _, recognized = parse_text_meta(intake.text(value))
+                        if recognized and recognized != account:
+                            raise ValueError("截图账号与文字账号不一致，整条消息未登记")
+            if kind == 'live':
+                page = intake.page_kind(result)
+                gaps = intake.live_metric_gaps(result, retry=True)
+                if gaps:
+                    issues.append(f"第{i}张{page}未取得有效值：" + "、".join(gaps))
+                if page not in intake.PAGE_METRICS:
+                    issues.append(f"第{i}张页面类型未确认，未能提取业务指标，请单独补发清晰原图")
             results.append(result)
             raw_results.append({"image_index": i, "result": result, "attempts": attempts})
             try:
@@ -859,13 +888,20 @@ def _handle_screenshots(message_id, full_text, image_keys):
         send_group_msg(f"未登记：{e}。")
         return
     issues.extend(merge_issues)
-    named = [r for r in candidates if kind == "anchor" and r["主播姓名"] in full_text]
+    target_text = re.sub(r'确认新主播\s*[:：]\s*[^\s，。；、,;]+', '', full_text)
+    named = [r for r in candidates if kind == "anchor" and r["主播姓名"] in target_text]
     if named:
         candidates = named
     created = updated = unchanged = 0
     # Serialize read/plan/write to prevent concurrent screenshot events creating duplicates.
     with _SCREENSHOT_WRITE_LOCK:
         existing = list_records(base, table, strict=True)
+        if kind == 'anchor':
+            try:
+                anchor_verify.check_roster(candidates, existing, account, full_text)
+            except ValueError as e:
+                send_group_msg(f"未登记：{e}。")
+                return
         plans = []
         for fields in candidates:
             try:
@@ -891,7 +927,7 @@ def _handle_screenshots(message_id, full_text, image_keys):
                 patch["数据状态"] = "草稿"
                 if attachments:
                     patch["截图附件"] = intake.append_attachments(old.get("截图附件"), attachments)
-                audit = {"version": "7.22", "message_id": message_id,
+                audit = {"version": "7.23", "message_id": message_id,
                          "mode": "更正" if correction else "补充", "issues": issues,
                          "changes": {k: {"before": old.get(k), "after": v}
                                      for k, v in patch.items() if k not in {"截图附件", "数据状态"}},
@@ -928,10 +964,14 @@ def _handle_screenshots(message_id, full_text, image_keys):
                 issues.append(f"明细已保存，但档案/月度或投放标记未同步：{e}；请稍后重发补图重试")
     parts = [f"新增{created}条，更新原记录{updated}条，无数值变化{unchanged}条。"]
     if created or updated:
-        parts.append("新增或更正的记录已设为草稿，请对照截图复查，再改为已复查；月汇总按已复查数据自动重算。")
+        if issues:
+            parts.append("已保存为草稿，请先处理下列需核对项，再标记已复查。")
+        else:
+            parts.append("已保存为草稿，请对照截图复查。改为已复查后，月汇总会自动重算。")
     if issues:
         parts.append("需核对：\n" + "\n".join(dict.fromkeys(issues)))
-    if not candidates:
+    metrics = intake.ANCHOR if kind == 'anchor' else intake.LIVE - {'开播时间'}
+    if not any(metrics.intersection(r) for r in candidates):
         parts.append("没有取得可登记指标，请补清晰截图。")
     send_group_msg("\n".join(parts))
 
@@ -1040,7 +1080,7 @@ def index():
 def version():
     """版本和环境变量状态确认（排查部署问题用）"""
     return jsonify({
-        "version": "7.22",
+        "version": "7.23",
         "encrypt_key_set": bool(ENCRYPT_KEY),
         "app_id_set": bool(APP_ID),
         "app_secret_set": bool(APP_SECRET),
