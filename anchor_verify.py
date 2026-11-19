@@ -29,9 +29,20 @@ def _rates(result, count):
     return values
 
 
+class NameChallenge(ValueError):
+    """One unresolved identity; the original per-column OCR evidence remains intact."""
+
+    def __init__(self, message, column, names, result=None, audit=None):
+        super().__init__(message)
+        self.column = column
+        self.names = tuple(names)
+        self.result = result
+        self.audit = audit
+
+
 def verify_anchor_columns(result, image_bytes, recognize):
     """An independent read of the original image; no first-pass guesses in the prompt."""
-    names = _names(result)
+    _names(result)
     try:
         raw = recognize(image_bytes, VERIFY_PROMPT)
         check = intake.parse_result(raw, kind='anchor')
@@ -39,29 +50,59 @@ def verify_anchor_columns(result, image_bytes, recognize):
         raise ValueError('主播姓名与留存率的二次核对未完成，请重发清晰原图') from error
     if intake.page_kind(check) != '主播分析':
         raise ValueError('二次核对未识别到主播对比图，请补清晰原图')
-    checked_names = _names(check)
-    if len(names) != len(checked_names):
-        raise ValueError('两次读取的主播人数不一致，请核对姓名列后重发')
     if '留存率' not in check:
         raise ValueError('二次核对缺少留存率行，请补清晰的主播对比图')
+    checked_names = _names(check)
+    audit = {'核对项目': '主播姓名与留存率', '主播姓名': checked_names,
+             '留存率': _rates(check, len(checked_names))}
+    return revalidate(result, audit)
+
+
+def revalidate(result, audit, confirmed=None):
+    """Apply an explicitly resolved column to saved evidence without a new AI read."""
+    names = _names(result)
+    checked_names = _names(audit)
+    if len(names) != len(checked_names):
+        raise ValueError('两次读取的主播人数不一致，请核对姓名列后重发')
+    if '留存率' not in audit:
+        raise ValueError('二次核对缺少留存率行，请补清晰的主播对比图')
     primary_rates = _rates(result, len(names))
-    checked_rates = _rates(check, len(names))
-    issues = []
+    checked_rates = _rates(audit, len(names))
+    resolved = {}
+    for key, value in (confirmed or {}).items():
+        if not re.fullmatch(r'[1-9][0-9]*', str(key)) or int(key) > len(names):
+            raise ValueError('姓名确认列与原图不符，请核对列号')
+        if (not isinstance(value, str) or intake.missing(value) or len(value.strip()) > 32
+                or not value.strip().isprintable()):
+            raise ValueError('请回复清晰完整的主播姓名')
+        resolved[int(key)] = value.strip()
+    problems, challenges = [], []
+    rate_conflict = False
     for index, (name, checked, rate, second_rate) in enumerate(
             zip(names, checked_names, primary_rates, checked_rates), 1):
-        if name != checked:
-            issues.append(f'第{index}列姓名两次读为“{name}”和“{checked}”')
+        if name != checked and index not in resolved:
+            message = f'第{index}列姓名两次读为“{name}”和“{checked}”'
+            problems.append(message)
+            challenges.append(NameChallenge(message, index, (name, checked), result, audit))
         try:
             same_rate = intake.equivalent(intake.number(rate, percent=True),
                                           intake.number(second_rate, percent=True))
         except ValueError:
             same_rate = False
         if not same_rate:
-            issues.append(f'第{index}列留存率两次读为“{rate if rate is not None else "空"}”和“{second_rate if second_rate is not None else "空"}”')
-    if issues:
-        raise ValueError('；'.join(issues) + '。请截取含完整姓名和留存率的清晰对比图，重新发送')
-    audit = {'核对项目': '主播姓名与留存率', '主播姓名': checked_names, '留存率': checked_rates}
-    return result, audit
+            rate_conflict = True
+            problems.append(f'第{index}列留存率两次读为“{rate if rate is not None else "空"}”和“{second_rate if second_rate is not None else "空"}”')
+    if rate_conflict:
+        raise ValueError('；'.join(problems) + '。请截取含完整姓名和留存率的清晰对比图，重新发送')
+    if challenges:
+        raise challenges[0]
+    if not resolved:
+        return result, audit
+    final_names = [resolved.get(index, name) for index, name in enumerate(names, 1)]
+    if len(set(final_names)) != len(final_names):
+        raise ValueError('确认后两列对应同一姓名，请核对原图，未合并两列数据')
+    updated_name = final_names if isinstance(result['主播姓名'], list) else final_names[0]
+    return {**result, '主播姓名': updated_name}, audit
 
 
 def _manually_verified_name(fields, name):
@@ -85,7 +126,7 @@ def _manually_verified_name(fields, name):
     return False
 
 
-def check_roster(candidates, existing, account, message):
+def check_roster(candidates, existing, account, message, confirmed_names=()):
     """Detect a one-character mismatch with a reviewed or manually verified name."""
     known = set()
     for row in existing:
@@ -95,9 +136,9 @@ def check_roster(candidates, existing, account, message):
         name = intake.text(f.get('主播姓名'))
         if name and (intake.text(f.get('数据状态')) == '已复查' or _manually_verified_name(f, name)):
             known.add(name)
-    for row in candidates:
+    for index, row in enumerate(candidates, 1):
         name = row.get('主播姓名', '')
-        if len(name) < 3 or name in known:
+        if len(name) < 3 or name in known or name in confirmed_names:
             continue
         similar = sorted(n for n in known if len(n) == len(name) and n[0] == name[0]
                          and sum(a != b for a, b in zip(name, n)) == 1)
@@ -105,5 +146,5 @@ def check_roster(candidates, existing, account, message):
             continue
         explicit = re.search(r'确认新主播\s*[:：]\s*' + re.escape(name) + r'(?=$|[\s，。；、,;])', message)
         if not explicit:
-            raise ValueError(f'图中姓名“{name}”和本账号已核对姓名“{"、".join(similar)}”相近。'
-                             f'请核对原图；若确为另一位主播，在重发文字中注明“确认新主播：{name}”')
+            reason = f'图中姓名“{name}”和本账号已核对姓名“{"、".join(similar)}”相近'
+            raise NameChallenge(reason, index, (name, *similar))

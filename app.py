@@ -1,5 +1,6 @@
 import os, json, base64, requests
 import tempfile
+import hashlib
 import threading
 import time
 import re
@@ -39,7 +40,9 @@ GROUP_CHAT = "oc_ecc73eac1ebd2fe694ef5b3d7687587f"
 from data_intake import PROMPT_LIVE, PROMPT_ANCHOR
 import data_intake as intake
 import anchor_verify
+import name_confirmations
 _SCREENSHOT_WRITE_LOCK = threading.Lock()
+_NAME_CONFIRMATIONS = name_confirmations.PendingStore()
 
 
 def get_tenant_token():
@@ -821,7 +824,11 @@ def recognize_screenshot(image_bytes, prompt, kind, image_index):
                 raise ValueError(f'第{image_index}张：{e}') from e
         if not retry_hint or attempt == 1:
             if kind == 'anchor':
-                result, check = anchor_verify.verify_anchor_columns(result, image_bytes, ai_recognize)
+                try:
+                    result, check = anchor_verify.verify_anchor_columns(result, image_bytes, ai_recognize)
+                except anchor_verify.NameChallenge as challenge:
+                    challenge.attempts = attempts + [challenge.audit]
+                    raise
                 attempts.append(check)
             return result, attempts
         previous = result if kind == 'live' else None
@@ -830,7 +837,7 @@ def recognize_screenshot(image_bytes, prompt, kind, image_index):
         app.logger.info('screenshot source retry: image=%s reason=%s', image_index, retry_hint)
 
 
-def _handle_screenshots(message_id, full_text, image_keys):
+def _handle_screenshots(message_id, full_text, image_keys, chat_id=None):
     """Accept one anchor comparison or two/three pages for a live session."""
     date, account = parse_text_meta(full_text)
     kind = "anchor" if "主播" in full_text else "live"
@@ -846,11 +853,18 @@ def _handle_screenshots(message_id, full_text, image_keys):
         return
     base, table = (BASE_ANCHOR, TABLE_ANCHOR) if kind == "anchor" else (BASE_LIVE, TABLE_LIVE)
     prompt = PROMPT_ANCHOR if kind == "anchor" else PROMPT_LIVE
-    results, raw_results, attachments, issues = [], [], [], []
+    raw_results, attachments, issues, image_hashes = [], [], [], []
     for i, image_key in enumerate(image_keys, 1):
         try:
             img = download_image(message_id, image_key)
-            result, attempts = recognize_screenshot(img, prompt, kind, i)
+            try:
+                result, attempts = recognize_screenshot(img, prompt, kind, i)
+            except anchor_verify.NameChallenge as challenge:
+                if not chat_id:
+                    raise
+                result, attempts = challenge.result, challenge.attempts
+            if kind == 'anchor' and chat_id:
+                image_hashes.append(hashlib.sha256(img).hexdigest())
             # Recognizable account contradictions block the batch. Truncated shop names
             # remain a review warning, not evidence for overwriting a different account.
             reads = [a['result'] for a in attempts if isinstance(a.get('result'), dict)] or [result]
@@ -868,7 +882,6 @@ def _handle_screenshots(message_id, full_text, image_keys):
                     issues.append(f"第{i}张{page}未取得有效值：" + "、".join(gaps))
                 if page not in intake.PAGE_METRICS:
                     issues.append(f"第{i}张页面类型未确认，未能提取业务指标，请单独补发清晰原图")
-            results.append(result)
             raw_results.append({"image_index": i, "result": result, "attempts": attempts})
             try:
                 token = upload_attachment(img, f"截图{i}", base)
@@ -880,28 +893,88 @@ def _handle_screenshots(message_id, full_text, image_keys):
             send_group_msg(f"未登记：{e}。请核对截图后重新发送。")
             return
         except Exception as e:
+            if kind == 'anchor' and chat_id:
+                reply_message(message_id, f"第{i}张主播原图读取失败，请重新发图登记。")
+                return
             issues.append(f"第{i}张识别失败：{e}")
+    batch = {"message_id": message_id, "chat_id": chat_id, "date": date, "account": account,
+             "kind": kind, "correction": correction, "session": session, "full_text": full_text,
+             "sources": raw_results, "attachments": attachments, "issues": issues, "confirmations": []}
+    if kind == 'anchor' and chat_id:
+        # Identify exact repeated submissions even when Feishu assigns a new image key.
+        batch['fingerprint'] = hashlib.sha256(json.dumps(
+            [date, account, correction, re.sub(r'@_user_\d+|\s+', '', full_text), image_hashes],
+            ensure_ascii=False).encode()).hexdigest()
+    _run_screenshot_batch(batch)
+
+
+def _run_screenshot_batch(batch, confirmation_id=None):
+    """Validate the complete batch before allowing any detail or summary writes."""
+    message_id, chat_id = batch['message_id'], batch['chat_id']
+    kind, date, account = batch['kind'], batch['date'], batch['account']
+    full_text, correction, session = batch['full_text'], batch['correction'], batch['session']
+    raw_results, attachments = batch['sources'], batch['attachments']
+    issues = list(batch['issues'])
+    base, table = (BASE_ANCHOR, TABLE_ANCHOR) if kind == "anchor" else (BASE_LIVE, TABLE_LIVE)
+    results = []
+    notify = (lambda text: reply_message(confirmation_id, text)) if confirmation_id else send_group_msg
+    for source in raw_results:
+        result = source['result']
+        if kind == 'anchor' and chat_id:
+            image = source['image_index']
+            verified = {c['column']: c['name'] for c in batch['confirmations'] if c['image'] == image}
+            try:
+                result, _ = anchor_verify.revalidate(result, source['attempts'][-1], verified)
+            except anchor_verify.NameChallenge as challenge:
+                return _ask_anchor_name(batch, image, challenge.column, str(challenge), confirmation_id)
+        results.append(result)
     try:
         candidates, merge_issues = intake.merge_results(results, kind, date, account, session)
     except ValueError as e:
         app.logger.warning('screenshot batch validation: kind=%s error=%s', kind, str(e))
-        send_group_msg(f"未登记：{e}。")
-        return
+        notify(f"未登记：{e}。")
+        return False
     issues.extend(merge_issues)
     target_text = re.sub(r'确认新主播\s*[:：]\s*[^\s，。；、,;]+', '', full_text)
-    named = [r for r in candidates if kind == "anchor" and r["主播姓名"] in target_text]
+    # A targeted correction may have named the original OCR spelling before the
+    # operator supplied the correct character. Preserve that selection on resume.
+    corrected_targets = set()
+    for check in batch['confirmations']:
+        source = raw_results[check['image'] - 1]
+        before = source['result']['主播姓名']
+        original_name = before[check['column'] - 1] if isinstance(before, list) else before
+        if original_name and original_name in target_text:
+            corrected_targets.add(check['name'])
+    named = [r for r in candidates if kind == "anchor" and
+             (r["主播姓名"] in target_text or r["主播姓名"] in corrected_targets)]
     if named:
         candidates = named
-    created = updated = unchanged = 0
+    created = updated = unchanged = metadata_saved = 0
+    retry_needed = False
     # Serialize read/plan/write to prevent concurrent screenshot events creating duplicates.
     with _SCREENSHOT_WRITE_LOCK:
         existing = list_records(base, table, strict=True)
         if kind == 'anchor':
+            confirmed_columns = {(c['image'], c['column']) for c in batch['confirmations']}
+            unconfirmed = {}
+            for source, result in zip(raw_results, results):
+                names = result['主播姓名']
+                for column, name in enumerate(names if isinstance(names, list) else [names], 1):
+                    position = (source['image_index'], column)
+                    if position not in confirmed_columns:
+                        unconfirmed.setdefault(name, position)
             try:
-                anchor_verify.check_roster(candidates, existing, account, full_text)
+                confirmed_names = {c['name'] for c in batch['confirmations']} - unconfirmed.keys()
+                anchor_verify.check_roster(candidates, existing, account, full_text, confirmed_names=confirmed_names)
+            except anchor_verify.NameChallenge as challenge:
+                if not chat_id:
+                    notify(f"未登记：{challenge}。")
+                    return False
+                image, column = unconfirmed[challenge.names[0]]
+                return _ask_anchor_name(batch, image, column, str(challenge), confirmation_id)
             except ValueError as e:
-                send_group_msg(f"未登记：{e}。")
-                return
+                notify(f"未登记：{e}。")
+                return False
         plans = []
         for fields in candidates:
             try:
@@ -913,7 +986,13 @@ def _handle_screenshots(message_id, full_text, image_keys):
                     fields = intake.route_daily_ads(fields, existing, target)
                 patch, conflict = intake.plan_patch(fields, target, correction)
                 issues.extend(conflict)
-                if not patch:
+                old = target["fields"] if target else {}
+                human_checks = [c for c in batch['confirmations'] if c['name'] == fields.get('主播姓名')]
+                # Keep the original image and human decision even when the existing
+                # metrics already match, without changing that row's review status.
+                old_tokens = {item.get('file_token') for item in old.get("截图附件") or []}
+                record_check_only = bool(not patch and human_checks and set(attachments) - old_tokens)
+                if not patch and not record_check_only:
                     unchanged += 1
                     if target:
                         try:
@@ -921,30 +1000,37 @@ def _handle_screenshots(message_id, full_text, image_keys):
                             if kind == "live":
                                 sync_shared_ad_scope(base, table, existing, target)
                         except Exception as e:
+                            retry_needed = True
                             issues.append(f"原明细未变，档案/月度同步失败：{e}")
                     continue
-                old = target["fields"] if target else {}
-                patch["数据状态"] = "草稿"
+                if not record_check_only:
+                    patch["数据状态"] = "草稿"
                 if attachments:
                     patch["截图附件"] = intake.append_attachments(old.get("截图附件"), attachments)
-                audit = {"version": "7.23", "message_id": message_id,
+                audit = {"version": "7.24", "message_id": message_id,
                          "mode": "更正" if correction else "补充", "issues": issues,
                          "changes": {k: {"before": old.get(k), "after": v}
                                      for k, v in patch.items() if k not in {"截图附件", "数据状态"}},
                          "sources": raw_results}
+                if human_checks:
+                    audit['人工原图核对'] = [{**c, '字段': {'主播姓名': {'核对后': c['name']}}}
+                                         for c in human_checks]
                 # Preserve the immediate previous provenance and bounded earlier history.
                 prior = intake.text(old.get("AI识别结果"))
                 patch["AI识别结果"] = json.dumps(audit, ensure_ascii=False) + ("\n---此前记录---\n" + prior[-20000:] if prior else "")
-                plans.append((target, patch))
+                plans.append((target, patch, record_check_only))
             except ValueError as e:
                 issues.append(str(e))
-        for target, patch in plans:
+        for target, patch, record_check_only in plans:
             try:
                 saved = target
                 if target:
                     update_record(base, table, target["record_id"], patch)
                     target["fields"].update(patch)
-                    updated += 1
+                    if record_check_only:
+                        metadata_saved += 1
+                    else:
+                        updated += 1
                 else:
                     result = write_record(base, table, patch)
                     new_record = (result.get("data") or {}).get("record")
@@ -953,6 +1039,7 @@ def _handle_screenshots(message_id, full_text, image_keys):
                         saved = new_record
                     created += 1
             except Exception as e:
+                retry_needed = True
                 issues.append(f"保存失败：{e}")
                 continue
             try:
@@ -961,8 +1048,11 @@ def _handle_screenshots(message_id, full_text, image_keys):
                     if kind == "live":
                         sync_shared_ad_scope(base, table, existing, saved)
             except Exception as e:
+                retry_needed = True
                 issues.append(f"明细已保存，但档案/月度或投放标记未同步：{e}；请稍后重发补图重试")
     parts = [f"新增{created}条，更新原记录{updated}条，无数值变化{unchanged}条。"]
+    if metadata_saved:
+        parts.append(f"另有{metadata_saved}条原记录的数值已一致，已补存原图及姓名确认记录。")
     if created or updated:
         if issues:
             parts.append("已保存为草稿，请先处理下列需核对项，再标记已复查。")
@@ -973,7 +1063,84 @@ def _handle_screenshots(message_id, full_text, image_keys):
     metrics = intake.ANCHOR if kind == 'anchor' else intake.LIVE - {'开播时间'}
     if not any(metrics.intersection(r) for r in candidates):
         parts.append("没有取得可登记指标，请补清晰截图。")
-    send_group_msg("\n".join(parts))
+    if confirmation_id:
+        latest = batch['confirmations'][-1]
+        parts.insert(0, f"已确认第{latest['image']}张第{latest['column']}列为{latest['name']}。")
+    notify("\n".join(parts))
+    return not retry_needed
+
+
+def _ask_anchor_name(batch, image, column, reason, confirmation_id):
+    """Save the original data before showing a question in the originating chat."""
+    chat, original = batch['chat_id'], batch['message_id']
+    if len(batch['attachments']) != len(batch['sources']):
+        reply_message(confirmation_id or original, "原图附件未保存完整，无法保留这批待确认数据，请将原图重新发送。")
+        return False
+    batch['question'] = {'image': image, 'column': column}
+    if confirmation_id:
+        saved = _NAME_CONFIRMATIONS.replace(chat, original, confirmation_id, batch)
+    else:
+        saved = _NAME_CONFIRMATIONS.put(chat, original, batch, fingerprint=batch['fingerprint'])
+    if saved:
+        prompt = (f"{batch['date']} {batch['account']}，第{image}张第{column}列姓名待确认。\n"
+                  f"{reason}\n请 @看数据 回复「是＋正确姓名」，或引用这条提示回复。确认后会用原图继续登记。")
+        sent = reply_message(original, prompt, strict=True)
+        prompt_id = (sent.get('data') or {}).get('message_id')
+        if prompt_id:
+            _NAME_CONFIRMATIONS.bind_prompt(chat, original, prompt_id)
+    return 'pending'
+
+
+def _handle_name_confirmation(msg, event, text, post_mentions_bot=False):
+    chat, reply_id = msg.get('chat_id'), msg.get('message_id')
+    sender = event.get('sender') or {}
+    if not chat or not reply_id or sender.get('sender_type', 'user') != 'user':
+        return
+    parsed = name_confirmations.parse_reply(text)
+    if parsed is None:
+        return
+    quoted = bool(msg.get('parent_id') or msg.get('root_id'))
+    mentioned = post_mentions_bot or bool(re.match(r'^\s*(?:@看数据|<at\b[^>]*>看数据</at>)', text))
+    if not mentioned:
+        mentioned = any(isinstance(m, dict) and m.get('name') == '看数据'
+                        and m.get('mentioned_type') != 'user' for m in msg.get('mentions') or [])
+    if msg.get('chat_type') == 'group' and not (quoted or mentioned):
+        return
+    column, name = parsed
+    status, original, batch = _NAME_CONFIRMATIONS.claim(
+        chat, reply_id, parent_id=msg.get('parent_id'), root_id=msg.get('root_id'))
+    if status != 'ready':
+        if status == 'none' and msg.get('chat_type') == 'group' and not mentioned:
+            return
+        messages = {
+            'ambiguous': '群里有多条待确认登记，请引用对应的机器人提示，再回复正确姓名。',
+            'none': '找不到对应的待确认登记。如果是升级前的提示、已过期或服务重启，请重新发送一次原图和登记文字。',
+            'busy': '这条姓名确认正在处理，请稍候。',
+            'done': '这条姓名确认已经处理，若仍有待确认列，请引用最新提示。',
+        }
+        reply_message(reply_id, messages[status])
+        return
+    try:
+        question = batch['question']
+        if column is not None and column != question['column']:
+            raise ValueError(f"当前询问第{question['image']}张第{question['column']}列，请按该列回复姓名")
+        identity = sender.get('sender_id') or {}
+        batch['confirmations'].append({**question, 'name': name, 'reply_id': reply_id,
+                                       'sender_id': identity.get('open_id') or identity.get('user_id')})
+        result = _run_screenshot_batch(batch, reply_id)
+        if result == 'pending':
+            return  # the claim was atomically advanced to the next question
+        if result:
+            _NAME_CONFIRMATIONS.finish(chat, original, reply_id)
+        else:
+            _NAME_CONFIRMATIONS.release(chat, original, reply_id)
+    except ValueError as e:
+        _NAME_CONFIRMATIONS.release(chat, original, reply_id)
+        reply_message(reply_id, f"未登记：{e}。请核对后重新回复。")
+    except Exception:
+        _NAME_CONFIRMATIONS.release(chat, original, reply_id)
+        app.logger.exception("anchor confirmation failed for message %s", original)
+        reply_message(reply_id, "本次登记未能完成，请稍后再回复一次正确姓名，我会重新核对原记录。")
 
 
 def _handle_webhook(raw):
@@ -1025,6 +1192,7 @@ def _handle_webhook(raw):
     if not isinstance(content_rows, list):
         content_rows = []
     image_keys, text_parts, link_urls, media_files = [], [], [], []
+    post_mentions_bot = False
     for row in content_rows:
         if not isinstance(row, list):
             continue
@@ -1036,6 +1204,8 @@ def _handle_webhook(raw):
                 image_keys.append(node.get("image_key"))
             elif tag == "text":
                 text_parts.append(node.get("text", ""))
+            elif tag == "at" and node.get("user_name") == "看数据":
+                post_mentions_bot = True
             elif tag == "a":
                 href = node.get("href", "")
                 if href:
@@ -1065,9 +1235,11 @@ def _handle_webhook(raw):
         _handle_recording(msg.get("message_id", ""), full_text, media_files)
         return
     if not image_keys:
-        return  # 无图，后台线程直接结束
+        if not media_files and not link_urls:
+            _handle_name_confirmation(msg, event, full_text, post_mentions_bot)
+        return
 
-    _handle_screenshots(msg.get("message_id", ""), full_text, image_keys)
+    _handle_screenshots(msg.get("message_id", ""), full_text, image_keys, chat_id=msg.get('chat_id'))
 
 
 
@@ -1080,7 +1252,7 @@ def index():
 def version():
     """版本和环境变量状态确认（排查部署问题用）"""
     return jsonify({
-        "version": "7.23",
+        "version": "7.24",
         "encrypt_key_set": bool(ENCRYPT_KEY),
         "app_id_set": bool(APP_ID),
         "app_secret_set": bool(APP_SECRET),
