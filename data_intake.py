@@ -25,14 +25,20 @@ PROMPT_LIVE = '''逐字读取本张直播截图，只返回JSON。不要计算�
 大屏的曝光-观看率（次数）不得写入本项目的曝光-观看率（人数）。大屏不得返回成交漏斗的五个字段。
 【成交漏斗】只从左侧成交转化漏斗读：直播间曝光人数、直播间观看人数、曝光-观看率（人数）、商品曝光-点击率（人数）、商品点击-成交转化率（人数）。JSON键仍用曝光-观看率、商品曝光-点击率、商品点击-成交转化率。
 三个比例分别紧贴曝光→观看、商品曝光→商品点击、商品点击→成交三段。不能读观看→商品曝光率，不能读最左侧曝光→成交率，不能读右侧互动漏斗的观看→互动率。不要用四舍五入过的人数反推截图比例。
-只返回当前页面允许的字段，所有值保留原文。开播时间、日期在图里没有时填null，不根据其他截图猜测。'''
+只返回当前页面允许的字段，所有值保留原文。开播时间、日期在图里没有时填null，不根据其他截图猜测。
+返回一个JSON对象（不是数组或字符串），固定包含“页面特征原文”（图上能看到的标题文字）和“开播时间原文”（复制顶部开播信息的完整原文；没有则null）。
+页面区分：巨量千川/千川乘方是千川；深色背景且顶部标题直播大屏的是罗盘大屏；有成交转化漏斗/互动转化漏斗的白色页面是成交漏斗。页面类型不能只因为有直播数据就都填罗盘大屏。
+开播时间只能取“开播时间 ... 开播”附近的时刻；必须同步抄录这段开播时间原文。千川页面更新时间、日期选择器、评论时间、视频时长、数据过期提示、折线图横轴刻度都不是开播时间。漏斗图没有顶部开播信息时，开播时间及原文必须为null。
+千川数据日期取右上日期选择器，不取“XX月XX日XX:XX更新”；原文日期范围可另填“统计日期原文”。不要把当天千川ROI和消耗当作另一个直播场次。'''
 
 PROMPT_ANCHOR = '''逐字读取抖音罗盘主播对比表，只返回JSON，不计算或猜测。
 页面类型固定为主播分析。数据日期、店铺名可为字符串；未显示填null。
 按左至右主播姓名的列顺序返回等长数组：主播姓名、所属账号、直播时长、直播时段、直播间用户支付金额、单小时用户支付金额、最高在线人数、平均在线人数、曝光-观看率、留存率、UV价值。
 直播时长在“概要数据”下面第一行，逐主播对齐，保留X小时Y分钟原文。时长不是直播时段；没有开始结束时刻就让直播时段为null。
 所有数值逐字抄录，保留小数点、逗号、货币符号、万、百分号。不要把金额取整或丢小数点。
-明确显示0、0.00、0%必须返回原始零值，不能当空值；未显示、模糊、--才返回null。所有缺项保留对应数组位置，不移动其他主播的数据。不要读颜色推断数值。'''
+明确显示0、0.00、0%必须返回原始零值，不能当空值；未显示、模糊、--才返回null。所有缺项保留对应数组位置，不移动其他主播的数据。不要读颜色推断数值。
+首选返回一个对象，其“主播姓名”等字段为数组，不是对象外包引号的JSON字符串。结构示意（null只是结构占位，实际值以图为准）：
+{"页面类型":"主播分析","数据日期":null,"店铺名":null,"主播姓名":[],"所属账号":[],"直播时长":[],"直播时段":[],"直播间用户支付金额":[],"单小时用户支付金额":[],"最高在线人数":[],"平均在线人数":[],"曝光-观看率":[],"留存率":[],"UV价值":[]}'''
 
 def text(v):
     if v is None:
@@ -139,28 +145,180 @@ def normalize(key, value):
         return text(value) or None
     return number(value, key in PERCENT)
 
-def parse_result(raw):
-    s = raw.strip()
-    if s.startswith('```'):
-        s = s.split('\n', 1)[1].rsplit('```', 1)[0]
-    r = json.loads(s)
-    if not isinstance(r, dict):
-        raise ValueError('识别结果不是对象')
+def parse_result(raw, kind=None):
+    """Accept bounded common JSON envelopes without guessing missing anchor columns."""
+    r = raw
+    for _ in range(3):
+        if not isinstance(r, str):
+            break
+        s = r.strip().lstrip('\ufeff')
+        fence = re.fullmatch(r'```(?:json)?\s*([\s\S]*?)\s*```', s, re.IGNORECASE)
+        if fence:
+            s = fence[1]
+        try:
+            r = json.loads(s)
+        except (ValueError, TypeError) as e:
+            raise ValueError('识别返回的JSON格式不完整') from e
+    metadata = {}
+    wrapper_keys = ('data', 'result', 'results', 'records', 'anchors', '主播数据', '主播列表', '识别结果', '数据')
+    meta_keys = {'页面类型', '页面特征原文', '数据日期', '店铺名', '所属账号', '账号', '类型',
+                 '开播时间原文', '统计日期原文', '统计口径'}
+    business = ANCHOR | LIVE | {'主播姓名', '直播时长(min)'}
+    for _ in range(3):
+        if isinstance(r, list) and len(r) == 1 and isinstance(r[0], dict):
+            r = r[0]
+            continue
+        if not isinstance(r, dict) or any(k in business for k in r):
+            break
+        candidates = [k for k in wrapper_keys if isinstance(r.get(k), (dict, list))]
+        if len(candidates) != 1:
+            break
+        for k in meta_keys:
+            if k in r and not missing(r[k]):
+                if k in metadata and not equivalent(metadata[k], r[k]):
+                    raise ValueError(f'识别结果包装层的{k}不一致')
+                metadata[k] = r[k]
+        r = r[candidates[0]]
+    if isinstance(r, list):
+        if not r or not all(isinstance(row, dict) for row in r):
+            raise ValueError('识别未返回有效主播记录，请补清晰原图')
+        if kind == 'live' or not all(text(row.get('主播姓名')) for row in r):
+            raise ValueError('单张图返回多组非主播数据，需重新识别')
+        keys = set().union(*(row.keys() for row in r)) | set(metadata)
+        columns = {k: [] for k in keys}
+        for row in r:
+            if page_kind(row) not in ('', '主播分析'):
+                raise ValueError('主播列表混有其他页面，需重新识别')
+            names = row['主播姓名'] if isinstance(row['主播姓名'], list) else [row['主播姓名']]
+            if not names or any(not text(n) or isinstance(n, (dict, list)) for n in names):
+                raise ValueError('主播姓名列格式不完整')
+            for i in range(len(names)):
+                for key in keys:
+                    value = row.get(key, metadata.get(key))
+                    if isinstance(value, list):
+                        if key in ANCHOR and len(value) != len(names):
+                            raise ValueError(f'{key}数组与主播人数不同，需重新识别并保留缺项位置')
+                        value = value[i] if i < len(value) else None
+                    elif len(names) > 1 and key in ANCHOR and not missing(value):
+                        raise ValueError(f'{key}未按主播列返回，无法确定归属')
+                    if key in metadata and not missing(value) and key in row and not equivalent(value, metadata[key]):
+                        raise ValueError(f'识别结果内外层的{key}不一致')
+                    columns[key].append(value)
+        columns['页面类型'] = '主播分析'
+        r = columns
+    elif isinstance(r, dict):
+        r = dict(r)
+        for k, v in metadata.items():
+            if k in r and not missing(r[k]) and not equivalent(r[k], v):
+                raise ValueError(f'识别结果内外层的{k}不一致')
+            r.setdefault(k, v)
+    else:
+        raise ValueError('识别未返回可登记的数据结构，请补清晰原图')
+    if kind == 'anchor' and not text(r.get('页面类型')) and text(r.get('主播姓名')):
+        r['页面类型'] = '主播分析'
+    if kind == 'anchor' or page_kind(r) == '主播分析':
+        names = r.get('主播姓名')
+        names = names if isinstance(names, list) else [names]
+        if not names or any(not text(n) or isinstance(n, (dict, list)) for n in names):
+            raise ValueError('主播姓名未识别完整，请重新读取顶部主播列')
+        for key in ANCHOR:
+            value = r.get(key)
+            if isinstance(value, list) and len(value) != len(names):
+                raise ValueError(f'{key}数组与主播人数不同，需重新识别并保留缺项位置')
+            if len(names) > 1 and not isinstance(value, list) and not missing(value):
+                raise ValueError(f'{key}未按主播列返回，无法确定归属')
     return r
+
+
+def header_identity(result):
+    """Read only a labelled start header; bare clocks/graph ticks are not identity."""
+    caption = text(result.get('开播时间原文'))
+    if not caption:
+        return None
+    date = r'(20\d{2})[./年-](\d{1,2})[./月-](\d{1,2})日?'
+    clock = r'([0-2]?\d[:：][0-5]\d)(?::\d{2})?'
+    match = re.search(r'(?:开播时间|开播于)\s*[:：]?\s*(?:' + date + r'\s*)?' + clock, caption)
+    if not match:
+        match = re.search(date + r'\s*' + clock + r'\s*开播', caption)
+    if not match:
+        return None
+    y, month, day, at = match.groups()
+    when = start_time(at)
+    shown_date = f'{y}-{int(month):02d}-{int(day):02d}' if y else None
+    if shown_date:
+        timestamp(shown_date)
+    return {'time': when, 'date': shown_date, 'caption': caption}
+
+
+def page_kind(result):
+    features = text(result.get('页面特征原文'))
+    # Visible source titles outrank a generic model-assigned page category.
+    if re.search(r'巨量千川|千川乘方', features):
+        return '千川'
+    if '成交转化漏斗' in features or '互动转化漏斗' in features:
+        return '成交漏斗'
+    if '直播大屏' in features:
+        return '罗盘大屏'
+    if '主播分析' in features or '对比主播' in features:
+        return '主播分析'
+    page = text(result.get('页面类型'))
+    return {'巨量千川': '千川', '千川乘方': '千川', '直播大屏': '罗盘大屏',
+            '罗盘直播大屏': '罗盘大屏', '直播转化漏斗': '成交漏斗',
+            '成交转化漏斗': '成交漏斗', '主播对比': '主播分析'}.get(page, page)
+
+
+def recognition_retry_reason(result, kind):
+    if kind == 'anchor':
+        if page_kind(result) != '主播分析':
+            return '未确认是主播对比表，请重读页面标题及顶部主播姓名列'
+        return None
+    page = page_kind(result)
+    if page not in {'千川', '罗盘大屏', '成交漏斗'}:
+        return '页面来源未识别，请逐字抄录页面标题并重新区分千川、大屏、成交漏斗'
+    if page == '罗盘大屏' and not header_identity(result):
+        return '缺少有效开播时间原文，请重看顶部开播信息；图表横轴和页面更新时间不能当开播时间'
+    return None
+
+
+def resolve_live_source(result, index):
+    source, issues = dict(result), []
+    page = page_kind(result)
+    source['页面类型'] = page
+    claimed = source.pop('开播时间', None)
+    header = header_identity(source) if page == '罗盘大屏' else None
+    if header:
+        source['开播时间'] = header['time']
+        if not missing(claimed):
+            try:
+                if start_time(claimed) != header['time']:
+                    issues.append(f'第{index}张开播时间按顶部原文校正为{header["time"]}')
+            except ValueError:
+                issues.append(f'第{index}张开播时间按顶部原文提取')
+        if header['date']:
+            source['数据日期'] = header['date']
+    elif not missing(claimed):
+        issues.append(f'第{index}张时间缺少大屏顶部开播依据，未用于场次判断')
+    return source, issues
 
 def merge_results(results, kind, date, account, session=None):
     if not date or not account:
         raise ValueError('请在文字中注明数据日期和账号，不从上传日期猜业务日期')
     day = timestamp(date)
     records, issues, conflicts = {}, [], set()
+    session_evidence = {}
     for index, result in enumerate(results, 1):
+        if kind == 'live':
+            result, source_issues = resolve_live_source(result, index)
+            issues.extend(source_issues)
+            if result.get('开播时间'):
+                session_evidence.setdefault(result['开播时间'], []).append(index)
         # An explicit screenshot date contradicting the message must be resolved, not overwritten.
         shown_date = result.get('数据日期')
         shown_dates = shown_date if isinstance(shown_date, list) else [shown_date]
         for d in shown_dates:
             if not missing(d) and timestamp(d) != day:
                 raise ValueError(f'第{index}张截图日期与文字日期不同，请核对后重发')
-        page = text(result.get('页面类型'))
+        page = page_kind(result)
         if kind == 'anchor':
             if page != '主播分析':
                 issues.append(f'第{index}张未确认是主播分析表，未取值')
@@ -219,7 +377,9 @@ def merge_results(results, kind, date, account, session=None):
     if kind == 'live' and records:
         rec = records['live']
         if ('live', '开播时间') in conflicts:
-            raise ValueError('多张大屏属于不同场次，请分场发送')
+            evidence = '；'.join('第' + '/'.join(map(str, indexes)) + '张顶部开播' + when
+                                for when, indexes in session_evidence.items())
+            raise ValueError(f'开播信息需核对：{evidence}。请按场分别发送，或重发顶部清晰原图')
         if session:
             if rec.get('开播时间') and rec['开播时间'] != session:
                 raise ValueError('截图开播时间与文字不同，请核对场次')
@@ -267,6 +427,8 @@ def route_daily_ads(fields, existing, target):
         if any(r['record_id'] != target_id and any(not missing(r['fields'].get(k)) for k in ADS) for r in same_day):
             raise ValueError('同日其他记录已有未标口径的投放，请先核实归属')
         f['投放统计口径'] = '全天主记录：ROI及整体消耗为同账号同日全天，仅此行计入'
+    elif not owners and not any(not missing(f.get(k)) for k in ADS):
+        f['投放统计口径'] = '待补全天投放：本场可先登记；同日千川图补齐后自动共用'
     return f
 
 def plan_patch(fields, target, correction=False):
